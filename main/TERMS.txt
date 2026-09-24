@@ -1,0 +1,83 @@
+PaliCAD Terms of Use
+
+Effective date: September 19, 2026
+
+These Terms of Use apply to PaliCAD and supplement the license under which the PaliCAD software is provided.
+
+PaliCAD is made available under the PolyForm Internal Use License 1.0.0. That license is provided separately and is not modified by these Terms.
+
+1. User Content
+
+“User Content” means files, data, models, drawings, designs, images, text, code, and other material that you create, import, or provide for use with PaliCAD.
+
+PaliCAD does not claim ownership of your User Content.
+
+You are responsible for ensuring that you have any rights or permissions necessary to use User Content that belongs to another person or organization.
+
+2. Output
+
+“Output” means files, models, drawings, designs, renderings, exports, toolpaths, documentation, data, and other results created through your use of PaliCAD.
+
+As between you and the PaliCAD licensor, the licensor claims no ownership rights in your Output solely because it was created using PaliCAD.
+
+The PaliCAD software license does not restrict your use of your Output.
+
+You may use, modify, reproduce, publish, distribute, license, sell, manufacture from, provide to clients, or otherwise commercially exploit your Output without payment of royalties or license fees to the PaliCAD licensor.
+
+This permission applies equally to personal, educational, research, professional, and commercial use of Output.
+
+3. Physical and Commercial Products
+
+You may use PaliCAD to design or develop physical or digital products for yourself, your employer, your clients, or other persons or organizations.
+
+Products designed, manufactured, or otherwise created using PaliCAD are not subject to the PaliCAD software license merely because PaliCAD was used in their creation.
+
+PaliCAD does not claim any royalty, revenue share, ownership interest, or other right in such products merely because they were created using PaliCAD.
+
+4. PaliCAD Material Included in Output
+
+The rights described above do not give you additional rights to PaliCAD itself.
+
+If an Output contains PaliCAD source code, object code, bundled assets, documentation, branding, or other material supplied as part of PaliCAD, that material remains subject to the license or terms that otherwise apply to it.
+
+Simply creating, saving, exporting, rendering, or manufacturing an Output using PaliCAD does not by itself cause the Output to become subject to the PaliCAD software license.
+
+5. Third-Party Rights
+
+These Terms only describe rights granted or claimed by the PaliCAD licensor.
+
+They do not grant you rights to material owned by third parties.
+
+For example, importing, modifying, converting, or exporting third-party material using PaliCAD does not give you ownership of that material or eliminate any rights that another person may have in it.
+
+Third-party libraries, components, fonts, models, assets, or other materials included with or used by PaliCAD may also be subject to their own licenses.
+
+6. PaliCAD Name and Branding
+
+No permission is granted under these Terms to use the PaliCAD name, logo, branding, or other identifiers in a manner that suggests that another product, service, or organization is an official PaliCAD product or is endorsed by PaliCAD.
+
+Use of PaliCAD to create an Output does not require you to credit, mention, or display the PaliCAD name or logo in connection with that Output.
+
+7. Pali Ijo
+
+PaliCAD may use the Pali Ijo CAD kernel.
+
+Pali Ijo is a separate software project and is licensed separately under the MIT License. The license applicable to Pali Ijo is provided with the Pali Ijo source code.
+
+These Terms do not limit rights separately granted under the Pali Ijo license.
+
+8. Relationship to the PaliCAD Software License
+
+These Terms do not replace or modify the PolyForm Internal Use License 1.0.0 applicable to PaliCAD.
+
+The PolyForm Internal Use License governs rights to use, copy, modify, and otherwise exercise rights in the PaliCAD software itself.
+
+These Terms separately clarify the PaliCAD licensor's position regarding User Content, Output, products created using PaliCAD, and PaliCAD branding.
+
+Nothing in these Terms is intended to reduce permissions granted to you under the PolyForm Internal Use License 1.0.0.
+
+9. Version of These Terms
+
+These Terms apply to the version of PaliCAD with which they are provided.
+
+Later versions of PaliCAD may be provided with different terms. Changes to terms accompanying a later version do not retroactively change the terms provided with an earlier version.
