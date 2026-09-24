@@ -1,7 +1,7 @@
 # PaliCAD
 PLACEHOLDER DIRECTORY TO BE UPLOADED SOON
 
-Direct-modeling CAD for **macOS / Windows** and **iPad**, built with **Flutter / Dart**. Modelling is **[pali ijo](packages/pali_ijo/)**, a standalone pure-Dart kernel with no Flutter dependency.
+Direct-modeling CAD for **macOS / Linux / Windows / Android** and **iPad**, built with **Flutter / Dart**. Modelling is **[pali ijo](packages/pali_ijo/)**, a standalone pure-Dart kernel with no Flutter dependency.
 
 Sketch on construction planes, extrude and edit solids, and save projects as `.pali` files.
 
