@@ -203,8 +203,10 @@ class MeshFaceRegions {
   /// group from the seed across shared edges and T-junctions. A pinch (two
   /// islands that only meet at a vertex — inscribed circle on a square)
   /// stays separate islands, like a through-cylinder splitting a cube face
-  /// into four. Curved seeds stay a local [growPlanarRegion] so clicking a
-  /// sphere triangle does not select the whole sphere.
+  /// into four. A curved seed with a B-Rep [MeshData.faceIds] tag selects its
+  /// whole analytic face (a fillet is one face, not a stack of strips).
+  /// Untagged curved seeds stay a local [growPlanarRegion] so clicking a
+  /// mesh-only sphere triangle does not select the whole sphere.
   static List<int> selectionRegion(MeshData mesh, int faceIndex) {
     if (faceIndex < 0 || faceIndex >= mesh.faces.length) return const [];
     return _cacheFor(mesh).selectionRegion(faceIndex);
@@ -902,7 +904,24 @@ class _MeshRegionCache {
 
     final planar = planarFaceNormals();
     if (planar[seed] == null) {
-      return growPlanarRegion(seed);
+      // A B-Rep tessellation tags every strip of a fillet / cylinder with its
+      // analytic face, so the whole surface is one CAD face. Untagged curved
+      // meshes stay local: an inferred smooth walk would swallow a sphere.
+      // An analytic face is connected, so the tags need no flood (which is
+      // quadratic and would stall on a dense thread flank).
+      final stored = mesh.faceIds;
+      final id = stored != null && stored.length == mesh.faces.length
+          ? stored[seed]
+          : -1;
+      if (id < 0) return growPlanarRegion(seed);
+      final result = <int>[
+        for (var f = 0; f < mesh.faces.length; f++)
+          if (stored![f] == id) f,
+      ];
+      for (final f in result) {
+        _selectionByFace[f] = result;
+      }
+      return result;
     }
 
     final ids = originalFaceIds();
