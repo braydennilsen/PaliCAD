@@ -15,6 +15,8 @@ class BrepRuledSurface implements BrepSurface {
     final dt = c.t1 - c.t0;
     final t = c.t0 + dt * u;
     if (c is BrepLine) return c.b - c.a;
+    if (c is BrepSplineCurve) return c.derivative(t) * dt;
+    if (c is BrepAffineCurve) return c.transform.vector(_derivative(c.base, u));
     if (c is BrepHelix) return c.derivative(t) * dt;
     if (c is BrepCircle) return c.tangent(t) * (c.radius * dt);
     if (c is BrepEllipse) {

@@ -1,73 +1,70 @@
 import 'dart:math' as math;
+import 'dart:collection';
 import 'dart:isolate';
 
 import 'package:vector_math/vector_math_64.dart';
 
 import 'mesh_data.dart';
 
-/// Broad phase for T-junction searches. Query the narrowest coordinate range,
-/// then retain only points in the segment's tolerance-expanded bounding box.
-/// The existing distance test remains the authority for splitting an edge.
+/// Spatial broad phase for T-junctions. Segment/box queries retain the exact
+/// point-on-segment predicate while avoiding scans of entire coordinate slabs.
 class _SegmentPointIndex {
-  _SegmentPointIndex(List<(int, Vector3)> points)
-    : axes = List.generate(
-        3,
-        (axis) =>
-            List.of(points)..sort((a, b) => a.$2[axis].compareTo(b.$2[axis])),
-      );
-
-  final List<List<(int, Vector3)>> axes;
-
-  int _bound(int axis, double value, {bool upper = false}) {
-    final points = axes[axis];
-    var lo = 0;
-    var hi = points.length;
-    while (lo < hi) {
-      final mid = (lo + hi) ~/ 2;
-      final coordinate = points[mid].$2[axis];
-      if (coordinate < value || (upper && coordinate == value)) {
-        lo = mid + 1;
-      } else {
-        hi = mid;
+  _SegmentPointIndex(List<(int, Vector3)> points) {
+    if (points.isEmpty) {
+      leaves = points;
+      return;
+    }
+    low = points.first.$2.clone();
+    high = low.clone();
+    for (final p in points) {
+      for (var axis = 0; axis < 3; axis++) {
+        low[axis] = math.min(low[axis], p.$2[axis]);
+        high[axis] = math.max(high[axis], p.$2[axis]);
       }
     }
-    return lo;
+    if (points.length <= 16) {
+      leaves = points;
+      return;
+    }
+    final extent = high - low;
+    var axis = 0;
+    if (extent.y > extent.x) axis = 1;
+    if (extent.z > extent[axis]) axis = 2;
+    points.sort((a, b) => a.$2[axis].compareTo(b.$2[axis]));
+    final mid = points.length ~/ 2;
+    left = _SegmentPointIndex(points.sublist(0, mid));
+    right = _SegmentPointIndex(points.sublist(mid));
+  }
+  Vector3 low = Vector3.zero(), high = Vector3.zero();
+  List<(int, Vector3)>? leaves;
+  _SegmentPointIndex? left, right;
+
+  List<(int, Vector3)> nearSegment(Vector3 a, Vector3 b) {
+    final result = <(int, Vector3)>[];
+    _collect(a, b - a, result);
+    return result;
   }
 
-  Iterable<(int, Vector3)> nearSegment(Vector3 a, Vector3 b) sync* {
-    const epsilon = MeshFaceRegions.planarGrowOffsetEpsilon;
-    final low = List.generate(
-      3,
-      (axis) => math.min(a[axis], b[axis]) - epsilon,
-    );
-    final high = List.generate(
-      3,
-      (axis) => math.max(a[axis], b[axis]) + epsilon,
-    );
-    var bestAxis = 0;
-    var start = 0;
-    var end = axes.first.length;
+  void _collect(Vector3 origin, Vector3 direction, List<(int, Vector3)> out) {
+    const eps = MeshFaceRegions.planarGrowOffsetEpsilon;
+    var start = 0.0, end = 1.0;
     for (var axis = 0; axis < 3; axis++) {
-      final lo = _bound(axis, low[axis]);
-      final hi = _bound(axis, high[axis], upper: true);
-      if (hi == lo) return;
-      if (hi - lo < end - start) {
-        bestAxis = axis;
-        start = lo;
-        end = hi;
+      final d = direction[axis], o = origin[axis];
+      if (d == 0) {
+        if (o < low[axis] - eps || o > high[axis] + eps) return;
+      } else {
+        final a = (low[axis] - eps - o) / d, b = (high[axis] + eps - o) / d;
+        start = math.max(start, math.min(a, b));
+        end = math.min(end, math.max(a, b));
+        if (start > end) return;
       }
     }
-    final points = axes[bestAxis];
-    for (var i = start; i < end; i++) {
-      final p = points[i].$2;
-      if (p.x >= low[0] &&
-          p.x <= high[0] &&
-          p.y >= low[1] &&
-          p.y <= high[1] &&
-          p.z >= low[2] &&
-          p.z <= high[2]) {
-        yield points[i];
-      }
+    final points = leaves;
+    if (points != null) {
+      out.addAll(points);
+    } else {
+      left!._collect(origin, direction, out);
+      right!._collect(origin, direction, out);
     }
   }
 }
@@ -75,35 +72,77 @@ class _SegmentPointIndex {
 /// A face on a plane must have its centroid in that plane's tolerance slab.
 /// This broad phase avoids scanning every triangle for every supporting plane.
 /// The original per-vertex plane predicate still makes the final decision.
+typedef _PlaneCandidate = ({
+  int id,
+  Vector3 center,
+  Vector3 normal,
+  double radius,
+});
+
 class _FacePlaneIndex {
-  _FacePlaneIndex(List<(int, Vector3)> faces) {
-    low = faces.first.$2.clone();
+  _FacePlaneIndex(List<_PlaneCandidate> faces) {
+    low = faces.first.center.clone();
     high = low.clone();
-    for (final (_, p) in faces) {
+    normalLow = Vector3.all(double.infinity);
+    normalHigh = Vector3.all(double.negativeInfinity);
+    final directionLow = faces.first.normal.clone(),
+        directionHigh = directionLow.clone();
+    for (final f in faces) {
       for (var axis = 0; axis < 3; axis++) {
-        low[axis] = math.min(low[axis], p[axis]);
-        high[axis] = math.max(high[axis], p[axis]);
+        low[axis] = math.min(low[axis], f.center[axis]);
+        high[axis] = math.max(high[axis], f.center[axis]);
+        normalLow[axis] = math.min(normalLow[axis], f.normal[axis] - f.radius);
+        normalHigh[axis] = math.max(
+          normalHigh[axis],
+          f.normal[axis] + f.radius,
+        );
+        directionLow[axis] = math.min(directionLow[axis], f.normal[axis]);
+        directionHigh[axis] = math.max(directionHigh[axis], f.normal[axis]);
       }
     }
     if (faces.length <= 16) {
       leaves = faces;
     } else {
-      final span = high - low;
+      final directionSpan = directionHigh - directionLow;
+      final radius = faces.fold(0.0, (double r, f) => math.max(r, f.radius));
+      final byDirection =
+          directionSpan.length2 > math.max(1e-16, 16 * radius * radius);
+      final span = byDirection ? directionSpan : high - low;
       var axis = 0;
       if (span.y > span.x) axis = 1;
       if (span.z > span[axis]) axis = 2;
-      faces.sort((a, b) => a.$2[axis].compareTo(b.$2[axis]));
+      faces.sort(
+        (a, b) => (byDirection ? a.normal[axis] : a.center[axis]).compareTo(
+          byDirection ? b.normal[axis] : b.center[axis],
+        ),
+      );
       final mid = faces.length ~/ 2;
       left = _FacePlaneIndex(faces.sublist(0, mid));
       right = _FacePlaneIndex(faces.sublist(mid));
     }
   }
-
-  late final Vector3 low, high;
-  List<(int, Vector3)>? leaves;
+  late final Vector3 low, high, normalLow, normalHigh;
+  List<_PlaneCandidate>? leaves;
   _FacePlaneIndex? left, right;
 
-  Iterable<int> nearPlane(Vector3 origin, Vector3 normal, double eps) sync* {
+  bool _exhausted = false;
+  void visitNearPlane(
+    Vector3 origin,
+    Vector3 normal,
+    double eps,
+    List<int> assigned,
+    void Function(int) visit,
+  ) {
+    if (_exhausted) return;
+    bool directionPossible(double sign) {
+      for (var axis = 0; axis < 3; axis++) {
+        final value = normal[axis] * sign;
+        if (value < normalLow[axis] || value > normalHigh[axis]) return false;
+      }
+      return true;
+    }
+
+    if (!directionPossible(1) && !directionPossible(-1)) return;
     var minD = 0.0, maxD = 0.0;
     for (var axis = 0; axis < 3; axis++) {
       final a = (low[axis] - origin[axis]) * normal[axis];
@@ -114,12 +153,15 @@ class _FacePlaneIndex {
     if (minD > eps || maxD < -eps) return;
     final entries = leaves;
     if (entries != null) {
-      for (final (id, center) in entries) {
-        if ((center - origin).dot(normal).abs() <= eps) yield id;
+      for (final f in entries) {
+        if (assigned[f.id] < 0 && (f.center - origin).dot(normal).abs() <= eps)
+          visit(f.id);
       }
+      _exhausted = entries.every((f) => assigned[f.id] >= 0);
     } else {
-      yield* left!.nearPlane(origin, normal, eps);
-      yield* right!.nearPlane(origin, normal, eps);
+      left!.visitNearPlane(origin, normal, eps, assigned, visit);
+      right!.visitNearPlane(origin, normal, eps, assigned, visit);
+      _exhausted = left!._exhausted && right!._exhausted;
     }
   }
 }
@@ -152,13 +194,22 @@ class MeshFaceRegions {
       _caches[mesh] ??= _MeshRegionCache(mesh);
 
   /// Run in an import worker before transferring ownership with Isolate.exit.
-  static PreparedMeshRegions prepare(MeshData mesh) {
+  /// [onProgress] counts the four display-cache preparation stages.
+  static PreparedMeshRegions prepare(
+    MeshData mesh, {
+    void Function(int completed, int total)? onProgress,
+  }) {
     final cache = _cacheFor(mesh);
+    onProgress?.call(0, 4);
     cache.planarFaceNormals();
+    onProgress?.call(1, 4);
     cache.sharpFeatureEdges();
+    onProgress?.call(2, 4);
     cache.cornerNormals();
+    onProgress?.call(3, 4);
     cache.silhouetteCandidates();
     cache.displayPrepared = true;
+    onProgress?.call(4, 4);
     return PreparedMeshRegions._(cache);
   }
 
@@ -203,8 +254,9 @@ class MeshFaceRegions {
   /// group from the seed across shared edges and T-junctions. A pinch (two
   /// islands that only meet at a vertex — inscribed circle on a square)
   /// stays separate islands, like a through-cylinder splitting a cube face
-  /// into four. Curved seeds stay a local [growPlanarRegion] so clicking a
-  /// sphere triangle does not select the whole sphere.
+  /// into four. Tagged curved faces select every triangle of their CAD face,
+  /// including fillets and periodic surfaces. Without source face IDs, curved
+  /// meshes retain the local planar fallback rather than guessing boundaries.
   static List<int> selectionRegion(MeshData mesh, int faceIndex) {
     if (faceIndex < 0 || faceIndex >= mesh.faces.length) return const [];
     return _cacheFor(mesh).selectionRegion(faceIndex);
@@ -637,6 +689,7 @@ class _MeshRegionCache {
   final Map<int, List<int>> _regionByFace = {};
   final Map<int, List<int>> _grownByFace = {};
   final Map<int, List<int>> _selectionByFace = {};
+  final Map<int, List<int>> _curvedTaggedFaces = {};
   Map<String, List<int>>? _edgeToFaces;
   List<(int, int)>? _featureEdges;
   List<(int, int)>? _sharpFeatureEdges;
@@ -893,6 +946,13 @@ class _MeshRegionCache {
     final cached = _selectionByFace[faceIndex];
     if (cached != null) return cached;
 
+    final planar = planarFaceNormals();
+    final stored = mesh.faceIds;
+    if (stored != null && stored.length == mesh.faces.length) {
+      final curved = _curvedTaggedFaces[stored[faceIndex]];
+      if (curved != null) return curved;
+    }
+
     var seed = faceIndex;
     if (_isSliver(seed)) {
       final host = _hostFaceForSliver(seed);
@@ -900,7 +960,6 @@ class _MeshRegionCache {
       seed = host;
     }
 
-    final planar = planarFaceNormals();
     if (planar[seed] == null) {
       return growPlanarRegion(seed);
     }
@@ -910,12 +969,20 @@ class _MeshRegionCache {
     if (id < 0) return growPlanarRegion(seed);
 
     final seedN = planar[seed]!;
+    final tagged =
+        stored != null &&
+        stored.length == mesh.faces.length &&
+        stored[seed] >= 0;
     final group = <int>[];
     for (var f = 0; f < mesh.faces.length; f++) {
       if (ids[f] != id) continue;
-      if (_isSliver(f)) continue;
+      // Native cap tessellation needs thin triangles around text and curved
+      // holes. Their CAD face tag is authoritative; dropping them cuts gaps
+      // through the selection fill and can disconnect the rest of the face.
+      final sliver = _isSliver(f);
+      if (sliver && !tagged) continue;
       final n = _faceNormal(f);
-      if (n != null && n.dot(seedN) < 0) continue;
+      if (!sliver && n != null && n.dot(seedN) < 0) continue;
       group.add(f);
     }
     if (group.length <= 1) return growPlanarRegion(seed);
@@ -1096,18 +1163,43 @@ class _MeshRegionCache {
         if (_faceNormal(f) != null && _area2(f) > 1e-16) f,
     ]..sort((a, b) => _area2(b).compareTo(_area2(a)));
 
-    final centers = <(int, Vector3)>[
-      for (final f in seeds)
-        (
-          f,
-          mesh.faces[f].fold(
-                Vector3.zero(),
-                (sum, vi) => sum + mesh.vertices[vi],
-              ) /
-              mesh.faces[f].length.toDouble(),
-        ),
+    final candidates = <_PlaneCandidate>[];
+    for (final f in seeds) {
+      if (_isSliver(f)) continue;
+      final face = mesh.faces[f];
+      final a = mesh.vertices[face[0]],
+          b = mesh.vertices[face[1]],
+          c = mesh.vertices[face[2]];
+      final ab = b - a, ac = c - a, bc = c - b;
+      final cross = ab.cross(ac), length = cross.length;
+      final longest = math.sqrt(
+        math.max(ab.length2, math.max(ac.length2, bc.length2)),
+      );
+      // If every vertex is within epsilon of a plane, its normal lies within
+      // 8*epsilon/altitude of one of the triangle's two unit normals. This
+      // conservative bound admits small/oblique triangles too; the original
+      // per-vertex predicate below still decides membership exactly.
+      final radius = math.min(2.0, 8 * planeEps * longest / length + 1e-10);
+      candidates.add((
+        id: f,
+        center:
+            face.fold(Vector3.zero(), (sum, vi) => sum + mesh.vertices[vi]) /
+            face.length.toDouble(),
+        normal: cross / length,
+        radius: radius,
+      ));
+    }
+    // Tiny triangles have wide normal bounds. Keep them out of the same
+    // hierarchy as well-conditioned faces, otherwise a few needles prevent
+    // pruning almost every node in a large curved mesh.
+    final buckets = <int, List<_PlaneCandidate>>{};
+    for (final candidate in candidates) {
+      final bucket = (math.log(candidate.radius) / math.ln2).floor();
+      (buckets[bucket] ??= []).add(candidate);
+    }
+    final planeIndices = [
+      for (final bucket in buckets.values) _FacePlaneIndex(bucket),
     ];
-    final planeIndex = centers.isEmpty ? null : _FacePlaneIndex(centers);
 
     for (final seed in seeds) {
       if (ids[seed] >= 0) continue;
@@ -1116,14 +1208,13 @@ class _MeshRegionCache {
       if (nrm == null) continue;
       final origin = mesh.vertices[mesh.faces[seed][0]];
       final id = next++;
-      for (final f in planeIndex!.nearPlane(origin, nrm, planeEps * 1.000001)) {
-        if (ids[f] >= 0) continue;
-        // Needles on a cube edge lie on two planes; claiming them here
-        // tags a top-face leftover with the cut-face ID and draws a
-        // diagonal. Attach to a unique host after the flood instead.
-        if (_isSliver(f)) continue;
-        if (!_vertsOnPlane(f, origin, nrm, planeEps)) continue;
-        ids[f] = id;
+      void assign(int f) {
+        if (ids[f] >= 0 || _isSliver(f)) return;
+        if (_vertsOnPlane(f, origin, nrm, planeEps)) ids[f] = id;
+      }
+
+      for (final index in planeIndices) {
+        index.visitNearPlane(origin, nrm, planeEps * 1.000001, ids, assign);
       }
     }
 
@@ -1241,6 +1332,21 @@ class _MeshRegionCache {
         out[f] = nHat;
       }
     }
+    // Reuse the groups already built during worker display preparation. A
+    // curved face's topology tag is authoritative even across periodic seams
+    // or tiny display slivers; a planar flood would select tessellation bands
+    // and can even leak into a tangent neighbor. Untagged inferred groups are
+    // deliberately excluded. Subsequent hover/pick lookup is constant-time.
+    final stored = mesh.faceIds;
+    if (stored != null && stored.length == n) {
+      for (final entry in byId.entries) {
+        if (entry.key >= 0 &&
+            stored[entry.value.first] == entry.key &&
+            out[entry.value.first] == null) {
+          _curvedTaggedFaces[entry.key] = entry.value;
+        }
+      }
+    }
     return _planarFaceNormals = out;
   }
 
@@ -1339,47 +1445,70 @@ class _MeshRegionCache {
     List<(int, int)> edges,
     List<Set<int>> vertFaceIds,
   ) {
-    var segs = List<(int, int)>.from(edges);
-    var guard = segs.length + 2;
-    var changed = true;
-    while (changed && guard-- > 0) {
-      changed = false;
-      final adj = <int, List<int>>{};
-      for (final (a, b) in segs) {
-        (adj[a] ??= []).add(b);
-        (adj[b] ??= []).add(a);
-      }
-      for (final entry in adj.entries) {
-        final v = entry.key;
-        final nbrs = entry.value;
-        if (nbrs.length != 2 || nbrs[0] == nbrs[1]) continue;
-        if (v < 0 || v >= vertFaceIds.length) continue;
-        if (vertFaceIds[v].length >= 3) continue;
-        final a = nbrs[0];
-        final b = nbrs[1];
-        if (!_collinearTriple(
-          mesh.vertices[a],
-          mesh.vertices[v],
-          mesh.vertices[b],
-        )) {
-          continue;
-        }
-        segs = [
-          for (final e in segs)
-            if (!_undirectedEq(e, a, v) && !_undirectedEq(e, v, b)) e,
-        ];
-        if (!segs.any((e) => _undirectedEq(e, a, b))) {
-          segs.add((a, b));
-        }
-        changed = true;
-        break;
-      }
+    final segments = <int, (int, int)>{};
+    final byPair = <(int, int), int>{};
+    final adjacent = <int, Set<int>>{};
+    (int, int) pair(int a, int b) => a < b ? (a, b) : (b, a);
+    var nextId = 0;
+    void insert(int a, int b) {
+      final id = nextId++;
+      segments[id] = (a, b);
+      byPair[pair(a, b)] = id;
+      (adjacent[a] ??= {}).add(id);
+      (adjacent[b] ??= {}).add(id);
     }
-    return segs;
-  }
 
-  bool _undirectedEq((int, int) e, int a, int b) =>
-      (e.$1 == a && e.$2 == b) || (e.$1 == b && e.$2 == a);
+    void remove(int id) {
+      final e = segments.remove(id)!;
+      byPair.remove(pair(e.$1, e.$2));
+      adjacent[e.$1]!.remove(id);
+      adjacent[e.$2]!.remove(id);
+    }
+
+    for (final e in edges) insert(e.$1, e.$2);
+    final ready = SplayTreeMap<int, int>(), priorities = <int, int>{};
+    void refresh(int v) {
+      final old = priorities.remove(v);
+      if (old != null) ready.remove(old);
+      final uses = adjacent[v]!;
+      if (uses.length != 2 ||
+          v < 0 ||
+          v >= vertFaceIds.length ||
+          vertFaceIds[v].length >= 3)
+        return;
+      final first = uses.reduce(math.min), last = uses.reduce(math.max);
+      final e = segments[first]!, f = segments[last]!;
+      final a = e.$1 == v ? e.$2 : e.$1, b = f.$1 == v ? f.$2 : f.$1;
+      if (a == b ||
+          !_collinearTriple(
+            mesh.vertices[a],
+            mesh.vertices[v],
+            mesh.vertices[b],
+          ))
+        return;
+      // Match the former scan order: the first surviving segment containing
+      // this vertex, with its first endpoint visited before its second.
+      final priority = first * 2 + (e.$1 == v ? 0 : 1);
+      priorities[v] = priority;
+      ready[priority] = v;
+    }
+
+    for (final v in adjacent.keys) refresh(v);
+    while (ready.isNotEmpty) {
+      final priority = ready.firstKey()!, v = ready.remove(priority)!;
+      priorities.remove(v);
+      final ids = adjacent[v]!.toList();
+      final e = segments[ids[0]]!, f = segments[ids[1]]!;
+      final a = e.$1 == v ? e.$2 : e.$1, b = f.$1 == v ? f.$2 : f.$1;
+      remove(ids[0]);
+      remove(ids[1]);
+      if (!byPair.containsKey(pair(a, b))) insert(a, b);
+      refresh(v);
+      refresh(a);
+      refresh(b);
+    }
+    return segments.values.toList();
+  }
 
   bool _collinearTriple(Vector3 a, Vector3 m, Vector3 b) {
     final ab = b - a;

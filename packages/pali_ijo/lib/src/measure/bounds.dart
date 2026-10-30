@@ -106,23 +106,59 @@ IjoBounds conservativeSphereFaceBounds(BrepSolid solid, BrepFace face) {
   final r = sphere.radius;
   final lo = sphere.center - Vector3.all(r);
   final hi = sphere.center + Vector3.all(r);
-  if (face.loops.isEmpty ||
-      !face.loops.every(
+  final constraints = <(Vector3, double)>[];
+  final closedCaps =
+      face.loops.isNotEmpty &&
+      face.loops.every(
         (loop) =>
             loop.coedges.length == 1 &&
             solid.edges[loop.coedges.single.edge].curve is BrepCircle &&
             (solid.edges[loop.coedges.single.edge].curve as BrepCircle)
                 .isClosed,
+      );
+  if (closedCaps) {
+    for (final loop in face.loops) {
+      final co = loop.coedges.single;
+      final circle = solid.edges[co.edge].curve as BrepCircle;
+      var n = co.reversed ? -circle.normal : circle.normal;
+      if (face.loops.length == 1) n = -n;
+      constraints.add((n, (circle.center - sphere.center).dot(n)));
+    }
+  } else if (face.loops.length == 1) {
+    // Convex great-circle wires (including spherical lunes with antipodal
+    // corners) need no finite UV chart. Each oriented arc bounds an exact
+    // hemisphere. Verify every complete arc, not just sampled vertices, before
+    // using these constraints; large complements/concave trims stay unbounded.
+    final uses = face.loops.single.coedges;
+    final arcs = <BrepCircle>[];
+    for (final co in uses) {
+      final c = solid.edges[co.edge].curve;
+      if (c is! BrepCircle ||
+          c.t1 <= c.t0 ||
+          c.t1 - c.t0 > math.pi + 1e-10 ||
+          c.center.distanceTo(sphere.center) > r * 1e-10 ||
+          (c.radius - r).abs() > r * 1e-10) {
+        arcs.clear();
+        break;
+      }
+      arcs.add(c);
+    }
+    if (arcs.length == uses.length && arcs.isNotEmpty) {
+      final normals = [
+        for (var i = 0; i < arcs.length; i++)
+          arcs[i].normal * ((uses[i].reversed != face.reversed) ? -1.0 : 1.0),
+      ];
+      if (normals.every(
+        (n) => arcs.every(
+          (c) => _circleSupport(c, sphere.center, -n) <= r * 1e-10,
+        ),
       )) {
-    return IjoBounds(lo, hi);
+        constraints.addAll(normals.map((n) => (-n, 0.0)));
+      }
+    }
   }
-  for (final loop in face.loops) {
-    final co = loop.coedges.single;
-    final circle = solid.edges[co.edge].curve as BrepCircle;
-    var n = co.reversed ? -circle.normal : circle.normal;
-    // One loop encloses a cap; multiple loops exclude caps from the sphere.
-    if (face.loops.length == 1) n = -n;
-    final h = (circle.center - sphere.center).dot(n);
+  for (final constraint in constraints) {
+    final (n, h) = constraint;
     if (h.abs() > r) continue;
     double support(Vector3 axis) {
       final d = axis.dot(n);
@@ -139,6 +175,66 @@ IjoBounds conservativeSphereFaceBounds(BrepSolid solid, BrepFace face) {
     }
   }
   return IjoBounds(lo, hi);
+}
+
+// Exact support of an increasing circular arc along a unit direction.
+double _circleSupport(BrepCircle c, Vector3 origin, Vector3 n) {
+  var result = math.max(
+    (c.evaluate(c.t0) - origin).dot(n),
+    (c.evaluate(c.t1) - origin).dot(n),
+  );
+  final phase = math.atan2(c.yDir.dot(n), c.xDir.dot(n));
+  final t = phase + ((c.t0 - phase) / (2 * math.pi)).ceil() * 2 * math.pi;
+  if (t <= c.t1) result = math.max(result, (c.evaluate(t) - origin).dot(n));
+  return result;
+}
+
+IjoBounds? _rectangularCylinderBounds(
+  BrepSolid s,
+  BrepFace f,
+  BrepCylinder cylinder,
+) {
+  if (f.loops.length != 1 || f.loops.single.coedges.length != 4) return null;
+  final curves = f.loops.single.coedges
+      .map((c) => s.edges[c.edge].curve)
+      .toList();
+  final arcs = curves.whereType<BrepCircle>().toList();
+  final lines = curves.whereType<BrepLine>().toList();
+  if (arcs.length != 2 || lines.length != 2) return null;
+  final tol = math.max(1e-9, cylinder.radius * 1e-10);
+  if (arcs.any(
+        (c) =>
+            c.t1 <= c.t0 ||
+            c.normal.cross(cylinder.axis).length > 1e-10 ||
+            (c.radius - cylinder.radius).abs() > tol ||
+            (c.center - cylinder.origin).cross(cylinder.axis).length > tol,
+      ) ||
+      lines.any((c) => (c.b - c.a).cross(cylinder.axis).length > tol)) {
+    return null;
+  }
+  // The two translated rims must cover the same angular interval.
+  Vector3 radial(Vector3 p) {
+    final d = p - cylinder.origin;
+    return d - cylinder.axis * d.dot(cylinder.axis);
+  }
+
+  final a = arcs[0], b = arcs[1];
+  bool match(bool reverse) => [0.0, .5, 1.0].every(
+    (t) =>
+        radial(a.evaluate(a.t0 + (a.t1 - a.t0) * t)).distanceTo(
+          radial(b.evaluate(b.t0 + (b.t1 - b.t0) * (reverse ? 1 - t : t))),
+        ) <=
+        tol,
+  );
+  if ((a.t1 - a.t0 - (b.t1 - b.t0)).abs() > 1e-10 ||
+      (!match(false) && !match(true))) {
+    return null;
+  }
+  final acc = BoundsBuilder();
+  for (final c in curves) {
+    _addCurveExtrema(acc, c);
+  }
+  return acc.result;
 }
 
 /// Conservative envelope for rejecting disjoint boolean operands. Unlike a
@@ -159,7 +255,9 @@ IjoBounds? conservativeSolidBounds(BrepSolid solid) {
 
   for (final face in solid.faces) {
     final surface = face.surface;
-    if (surface is BrepRuledSurface && surface.lower is BrepHelix && surface.upper is BrepHelix) {
+    if (surface is BrepRuledSurface &&
+        surface.lower is BrepHelix &&
+        surface.upper is BrepHelix) {
       // Every ruling is a convex combination of its two exact rail points.
       for (final p in (surface.lower as BrepHelix).boundsPoints) acc.add(p);
       for (final p in (surface.upper as BrepHelix).boundsPoints) acc.add(p);
@@ -172,8 +270,18 @@ IjoBounds? conservativeSolidBounds(BrepSolid solid) {
       continue;
     }
     if (surface is BrepSphere) {
-      ball(surface.center, surface.radius, acc);
+      final box = conservativeSphereFaceBounds(solid, face);
+      acc.add(box.min);
+      acc.add(box.max);
       continue;
+    }
+    if (surface is BrepCylinder) {
+      final box = _rectangularCylinderBounds(solid, face, surface);
+      if (box != null) {
+        acc.add(box.min);
+        acc.add(box.max);
+        continue;
+      }
     }
     if (surface is BrepTorus) {
       ball(surface.center, surface.majorRadius + surface.minorRadius, acc);
@@ -216,9 +324,31 @@ IjoBounds? conservativeSolidBounds(BrepSolid solid) {
             boundary.add(curve.a);
             boundary.add(curve.b);
           case BrepCircle curve:
-            ball(curve.center, curve.radius, boundary);
+            if (surface is BrepPlane && curve.t1 >= curve.t0) {
+              _addCurveExtrema(boundary, curve);
+              break;
+            }
+            final extent = Vector3.zero();
+            for (var i = 0; i < 3; i++) {
+              extent[i] =
+                  curve.radius *
+                  math.sqrt(
+                    curve.xDir[i] * curve.xDir[i] +
+                        curve.yDir[i] * curve.yDir[i],
+                  );
+            }
+            boundary.add(curve.center - extent);
+            boundary.add(curve.center + extent);
           case BrepEllipse curve:
-            ball(curve.center, math.max(curve.rMajor, curve.rMinor), boundary);
+            final extent = Vector3.zero();
+            for (var i = 0; i < 3; i++) {
+              extent[i] = math.sqrt(
+                math.pow(curve.xDir[i] * curve.rMajor, 2) +
+                    math.pow(curve.yDir[i] * curve.rMinor, 2),
+              );
+            }
+            boundary.add(curve.center - extent);
+            boundary.add(curve.center + extent);
         }
       }
     }
@@ -249,8 +379,14 @@ IjoBounds? conservativeSolidBounds(BrepSolid solid) {
               (surface as BrepCone).radiusAt(z0).abs(),
               surface.radiusAt(z1).abs(),
             );
-      ball(origin + axis * z0, radius, acc);
-      ball(origin + axis * z1, radius, acc);
+      final extent = Vector3.zero();
+      for (var i = 0; i < 3; i++) {
+        extent[i] = radius * math.sqrt(math.max(0, 1 - axis[i] * axis[i]));
+      }
+      for (final z in [z0, z1]) {
+        acc.add(origin + axis * z - extent);
+        acc.add(origin + axis * z + extent);
+      }
     }
   }
   return acc.result;

@@ -4,14 +4,20 @@ import 'package:vector_math/vector_math_64.dart';
 
 import '../mesh/mesh_data.dart';
 import 'fillet.dart';
+import 'convex_planes.dart';
+import 'curve_equivalence.dart';
 import 'geom.dart';
 import 'heal.dart';
 import 'intersect.dart';
 import 'primitives.dart';
 import 'provenance.dart';
 import 'solid.dart';
+import 'spline_convert.dart';
 import 'slice.dart';
 import 'tessellate.dart';
+import 'xform.dart';
+
+part 'hollow_ruled_offset.dart';
 
 /// Face-offset shell: inset every face except the opening, drop the opening,
 /// and stitch the outer rim to the inner rim.
@@ -132,12 +138,74 @@ class BrepHollow {
         throw BrepUnsupported('Hollow opening face is out of range');
       }
     }
+    // Placed bodies may wrap even their planes in affine surfaces. Recover
+    // those exact planes before intersecting offsets; never modify the source.
+    BrepPlane? planeOf(BrepSurface surface) {
+      if (surface is BrepPlane) return surface;
+      if (surface is BrepAffineSurface) {
+        final base = planeOf(surface.base);
+        if (base != null) {
+          return BrepPlane(
+            origin: surface.transform.point(base.origin),
+            normal: surface.transform.normal(base.normal),
+            xDir: surface.transform.vector(base.xDir).normalized(),
+          );
+        }
+      }
+      return null;
+    }
+
+    solid = BrepXform.materializeForEditing(
+      solid,
+      preserveAffineSweeps: true,
+    ).clone();
+    bool lineCurve(BrepCurve c) =>
+        c is BrepLine || c is BrepAffineCurve && lineCurve(c.base);
+    for (final edge in solid.edges) {
+      final c = edge.curve;
+      if (c is BrepAffineCurve && lineCurve(c)) {
+        edge.curve = BrepLine(c.evaluate(c.t0), c.evaluate(c.t1));
+      }
+    }
+    for (final face in solid.faces) {
+      face.surface = planeOf(face.surface) ?? face.surface;
+    }
     final opening = openingFaces.toSet();
+    if (BrepConvexPlanes.supports(solid)) {
+      final clipped = BrepConvexPlanes.clip(solid, [
+        for (var fi = 0; fi < solid.faces.length; fi++)
+          BrepPlane(
+            origin:
+                (solid.faces[fi].surface as BrepPlane).origin -
+                solid.faces[fi].outwardNormal(0, 0) *
+                    (opening.contains(fi) ? 0 : t),
+            normal: solid.faces[fi].outwardNormal(0, 0),
+          ),
+      ], sources: List.generate(solid.faces.length, (i) => i));
+      if (opening.any((fi) => !clipped.faceMap.containsKey(fi))) {
+        throw BrepUnsupported('Hollow thickness closes the selected opening');
+      }
+      return BrepHeal.sewClosedRims(
+        _stitch(
+          solid,
+          clipped.solid,
+          opening,
+          innerFaceMap: clipped.faceMap,
+          planarRims: true,
+        ),
+      );
+    }
     final inner = _offsetInward(solid, t, opening);
     return BrepHeal.sewClosedRims(_stitch(solid, inner, opening));
   }
 
-  static BrepSolid _stitch(BrepSolid outer, BrepSolid inner, Set<int> opening) {
+  static BrepSolid _stitch(
+    BrepSolid outer,
+    BrepSolid inner,
+    Set<int> opening, {
+    Map<int, int>? innerFaceMap,
+    bool planarRims = false,
+  }) {
     final b = BrepBuilder();
     int weld(Vector3 p) {
       for (var i = 0; i < b.vertices.length; i++) {
@@ -148,6 +216,11 @@ class BrepHollow {
 
     final edgeOf = <String, int>{};
     (int, bool) sew(int i, int j, BrepCurve curve) {
+      // Legacy planar booleans can store a line opposite to its vertex order.
+      // New rim topology (and STEP edge directions) must agree with the wire.
+      if (planarRims && curve is BrepLine) {
+        curve = BrepLine(b.vertices[i], b.vertices[j]);
+      }
       final mid = curve.evaluate(0.5 * (curve.t0 + curve.t1));
       final q =
           '${(mid.x * 1e4).round()}_${(mid.y * 1e4).round()}_${(mid.z * 1e4).round()}';
@@ -157,6 +230,14 @@ class BrepHollow {
       final existing = edgeOf[k];
       if (existing != null) {
         final e = b.edges[existing];
+        if (i == j) {
+          final c = e.curve;
+          final oldTangent = c.tangent((c.t0 + c.t1) * .5) * (c.t1 - c.t0).sign;
+          final newTangent =
+              curve.tangent((curve.t0 + curve.t1) * .5) *
+              (curve.t1 - curve.t0).sign;
+          return (existing, oldTangent.dot(newTangent) < 0);
+        }
         return (existing, e.v0 != i);
       }
       final id = b.edge(i, j, curve);
@@ -165,8 +246,11 @@ class BrepHollow {
     }
 
     void addSolid(BrepSolid s, {required bool reverse}) {
+      final omitted = reverse && innerFaceMap != null
+          ? opening.map((fi) => innerFaceMap[fi]).toSet()
+          : opening;
       for (var fi = 0; fi < s.faces.length; fi++) {
-        if (opening.contains(fi)) continue;
+        if (omitted.contains(fi)) continue;
         final f = s.faces[fi];
         // Closed-circle sphere wires select the retained cap independently
         // of the face normal (also used by classification and saved files).
@@ -203,11 +287,38 @@ class BrepHollow {
     addSolid(inner, reverse: true);
 
     for (final fi in opening) {
-      if (fi < 0 || fi >= outer.faces.length || fi >= inner.faces.length) {
+      final innerFi = innerFaceMap?[fi] ?? fi;
+      if (fi < 0 || fi >= outer.faces.length || innerFi >= inner.faces.length) {
         continue;
       }
       final of = outer.faces[fi];
-      final inf = inner.faces[fi];
+      final inf = inner.faces[innerFi];
+      if (planarRims) {
+        // Offset corners may split or disappear, so the inner opening need
+        // not have the same number of edges. One planar face with an inner
+        // trim joins both wires without inventing a correspondence.
+        BrepLoop copyLoop(BrepSolid s, BrepLoop loop, bool reverse) {
+          final coedges = <BrepCoedge>[];
+          for (final c in loop.coedges) {
+            final e = s.edges[c.edge];
+            final se = sew(
+              weld(s.vertices[e.v0]),
+              weld(s.vertices[e.v1]),
+              e.curve,
+            );
+            coedges.add(
+              BrepCoedge(se.$1, reversed: se.$2 ^ c.reversed ^ reverse),
+            );
+          }
+          return BrepLoop(reverse ? coedges.reversed.toList() : coedges);
+        }
+
+        b.face(of.surface, [
+          copyLoop(outer, of.loops.single, false),
+          copyLoop(inner, inf.loops.single, true),
+        ], reversed: of.reversed);
+        continue;
+      }
       final loopCount = math.min(of.loops.length, inf.loops.length);
       if (loopCount == 0) continue;
       // Both loop conventions occur in saved and Boolean-created faces:
@@ -282,7 +393,23 @@ class BrepHollow {
       if (n.length < 1e-12) continue;
       // The strip inherits the opening loop's winding; reverse it when
       // that wire runs against the outward orientation of the opening.
-      b.face(BrepPlane(origin: o.$1, normal: n.normalized()), [
+      final plane = BrepPlane(origin: o.$1, normal: n.normalized());
+      bool onPlane(BrepCurve curve) {
+        bool rational(BrepCurve c) =>
+            c is BrepLine ||
+            c is BrepCircle ||
+            c is BrepEllipse ||
+            c is BrepSplineCurve ||
+            c is BrepAffineCurve && rational(c.base);
+        if (!rational(curve)) return false;
+        // Control-net containment proves planarity between samples as well.
+        return BrepSplineConvert.curve(
+          curve,
+        ).points.every((p) => plane.height(p).abs() < 1e-7);
+      }
+
+      final planar = onPlane(o.$3) && onPlane(i.$3);
+      b.face(planar ? plane : BrepRuledSurface(o.$3, i.$3), [
         BrepLoop([
           BrepCoedge(e0.$1, reversed: e0.$2),
           BrepCoedge(e1.$1, reversed: e1.$2),
@@ -345,7 +472,7 @@ class BrepHollow {
     double ringSize(BrepCurve curve) => switch (curve) {
       BrepCircle c => c.radius * c.radius,
       BrepEllipse e => e.rMajor * e.rMinor,
-      _ => 0,
+      _ => _ringArea(curve),
     };
     if (ringSize(inner.$3) > ringSize(outer.$3)) {
       final swap = outer;
@@ -361,6 +488,18 @@ class BrepHollow {
       BrepLoop([BrepCoedge(e0.$1, reversed: e0.$2)]),
       BrepLoop([BrepCoedge(e1.$1, reversed: !e1.$2)]),
     ]);
+  }
+
+  static double _ringArea(BrepCurve curve) {
+    final origin = curve.evaluate(curve.t0);
+    var area = Vector3.zero(), previous = Vector3.zero();
+    for (var i = 1; i <= 128; i++) {
+      final p =
+          curve.evaluate(curve.t0 + (curve.t1 - curve.t0) * i / 128) - origin;
+      area += previous.cross(p);
+      previous = p;
+    }
+    return area.length / (2 * math.pi);
   }
 
   static List<(Vector3, Vector3, BrepCurve)> _loopSegments(
@@ -434,6 +573,12 @@ class BrepHollow {
   }
 
   static BrepCurve _flipped(BrepCurve c) {
+    if (c is BrepSplineCurve) return c.trimmed(c.t1, c.t0);
+    if (c is BrepAffineCurve) {
+      return BrepAffineCurve(_flipped(c.base), c.transform);
+    }
+    if (c is BrepPlaneSectionCurve) return c.trimmed(c.t1, c.t0);
+    if (c is BrepSurfaceIntersectionCurve) return c.trimmed(c.t1, c.t0);
     if (c is BrepLine) return BrepLine(c.b, c.a);
     if (c is BrepCircle) {
       return BrepCircle(
@@ -445,7 +590,7 @@ class BrepHollow {
         t1: c.t0,
       );
     }
-    if (c is BrepEllipse)
+    if (c is BrepEllipse) {
       return BrepEllipse(
         center: c.center,
         normal: c.normal,
@@ -455,6 +600,7 @@ class BrepHollow {
         t0: c.t1,
         t1: c.t0,
       );
+    }
     return c;
   }
 
@@ -462,8 +608,9 @@ class BrepHollow {
     if (s.faces.length == 1 && s.faces.first.surface is BrepSphere) {
       final sp = s.faces.first.surface as BrepSphere;
       final r = sp.radius - t;
-      if (r <= 1e-8)
+      if (r <= 1e-8) {
         throw BrepUnsupported('Hollow thickness removes the entire interior');
+      }
       return BrepPrimitives.sphere(center: sp.center, radius: r);
     }
 
@@ -480,12 +627,14 @@ class BrepHollow {
           final uv = face.surface.parameters(p)!;
           final n = face.outwardNormal(uv.$1, uv.$2);
           for (final adj in BrepFillet.facesForEdge(s, co.edge)) {
-            if (opening.contains(adj) || s.faces[adj].surface is BrepPlane)
+            if (opening.contains(adj) || s.faces[adj].surface is BrepPlane) {
               continue;
+            }
             final other = s.faces[adj];
             final ouv = other.surface.parameters(p)!;
-            if (n.dot(other.outwardNormal(ouv.$1, ouv.$2)) > 1 - 1e-8)
+            if (n.dot(other.outwardNormal(ouv.$1, ouv.$2)) > 1 - 1e-8) {
               return true;
+            }
           }
         }
       }
@@ -655,6 +804,8 @@ class BrepHollow {
         xDir: s.xDir,
       );
     }
+    final swept = _offsetExtrusion(face, t);
+    if (swept != null) return swept;
     throw BrepUnsupported(
       'Hollow offset of ${s.runtimeType} is not implemented yet',
     );
@@ -737,7 +888,9 @@ class BrepHollow {
         final n = surface.normalAt(uv.$1, uv.$2);
         final distance = (q - closest).dot(n);
         final independent = n.clone();
-        for (final axis in span) independent.sub(axis * independent.dot(axis));
+        for (final axis in span) {
+          independent.sub(axis * independent.dot(axis));
+        }
         if (independent.length > 1e-7) span.add(independent.normalized());
         for (var i = 0; i < 3; i++) {
           rhs[i] -= n[i] * distance;
@@ -751,7 +904,9 @@ class BrepHollow {
       for (var i = 0; i < 3; i++) {
         for (var j = 0; j < 3; j++) {
           var nullProjection = i == j ? 1.0 : 0.0;
-          for (final axis in span) nullProjection -= axis[i] * axis[j];
+          for (final axis in span) {
+            nullProjection -= axis[i] * axis[j];
+          }
           matrix.setEntry(i, j, matrix.entry(i, j) + nullProjection);
         }
       }
@@ -781,6 +936,85 @@ class BrepHollow {
     final a = inner.vertices[e.v0];
     final b = inner.vertices[e.v1];
     final oc = orig.edges[edgeId].curve;
+    final neighbors = BrepFillet.facesForEdge(orig, edgeId);
+    if (oc is! BrepLine) {
+      final planes = [
+        for (final fi in neighbors)
+          if (offsetSurfs[fi] is BrepPlane) offsetSurfs[fi] as BrepPlane,
+      ];
+      final sweeps = [
+        for (final fi in neighbors)
+          if (offsetSurfs[fi] is BrepRuledSurface)
+            offsetSurfs[fi] as BrepRuledSurface,
+      ];
+      if (planes.length == 1 && sweeps.length == 1) {
+        final wall = sweeps.single;
+        var ua = wall.parameters(a).$1, ub = wall.parameters(b).$1;
+        if (e.v0 == e.v1 &&
+            (oc.evaluate(oc.t0) - oc.evaluate(oc.t1)).length < 1e-8) {
+          ua = 0;
+          ub = 1;
+          if (wall.du(0, 0).dot(oc.tangent(oc.t0) * (oc.t1 - oc.t0).sign) < 0) {
+            ua = 1;
+            ub = 0;
+          }
+        }
+        if (e.v0 != e.v1 &&
+            (ub - ua) *
+                    wall
+                        .du(ua, 0)
+                        .dot(oc.tangent(oc.t0) * (oc.t1 - oc.t0).sign) <=
+                1e-12) {
+          throw BrepUnsupported(
+            'Hollow thickness collapses a curved inner edge. Use a thinner wall.',
+          );
+        }
+        final curve = BrepPlaneSectionCurve(
+          surface: wall,
+          plane: planes.single,
+          t0: ua,
+          t1: ub,
+        );
+        if ((curve.evaluate(ua) - a).length > 1e-6 ||
+            (curve.evaluate(ub) - b).length > 1e-6) {
+          throw BrepUnsupported(
+            'Hollow curved boundary misses its offset vertex',
+          );
+        }
+        final lower = wall.lower;
+        final delta = wall.evaluate(0, 1) - wall.evaluate(0, 0);
+        final plane = planes.single,
+            denominator = delta.dot(planes.single.normal);
+        if (lower is BrepSplineCurve &&
+            denominator.abs() > 1e-12 * delta.length) {
+          // A plane section of a translational spline sweep is an affine
+          // projection of its rail: preserve the exact rational control net.
+          return BrepSplineCurve(
+            degree: lower.degree,
+            points: [
+              for (final p in lower.points)
+                p - delta * (plane.height(p) / denominator),
+            ],
+            knots: lower.knots,
+            weights: lower.weights,
+            start: lower.t0 + (lower.t1 - lower.t0) * ua,
+            end: lower.t0 + (lower.t1 - lower.t0) * ub,
+          );
+        }
+        return curve;
+      }
+      if (planes.length == 2) {
+        final direction = b - a;
+        final straight =
+            direction.length > 1e-10 &&
+            [0.0, .25, .5, .75, 1.0].every((u) {
+              final p =
+                  oc.evaluate(oc.t0 + (oc.t1 - oc.t0) * u) - oc.evaluate(oc.t0);
+              return p.cross(direction).length < 1e-7 * direction.length;
+            });
+        if (straight) return BrepLine(a, b);
+      }
+    }
     if (oc is BrepLine) {
       return BrepLine(a, b);
     }
@@ -868,8 +1102,9 @@ class BrepHollow {
         );
         for (final candidate in intersections.whereType<BrepEllipse>()) {
           if ((candidate.closestPoint(a) - a).length > 1e-6 ||
-              (candidate.closestPoint(b) - b).length > 1e-6)
+              (candidate.closestPoint(b) - b).length > 1e-6) {
             continue;
+          }
           final oriented = BrepEllipse(
             center: candidate.center,
             normal: oc.normal,

@@ -364,7 +364,9 @@ class BrepSplineSurface implements BrepSurface {
     var h = Vector3.zero(), hu = Vector3.zero(), hv = Vector3.zero();
     var w = 0.0, wu = 0.0, wv = 0.0;
     for (var i = 0; i < a.length; i++) {
+      if (a[i] == 0 && da[i] == 0) continue;
       for (var j = 0; j < b.length; j++) {
+        if (b[j] == 0 && db[j] == 0) continue;
         final c = a[i] * b[j] * weights[i][j],
             cu = da[i] * b[j] * weights[i][j],
             cv = a[i] * db[j] * weights[i][j];
@@ -395,23 +397,24 @@ class BrepSplineSurface implements BrepSurface {
   }
 
   @override
-  (double, double) parameters(Vector3 p) {
+  (double, double) parameters(Vector3 p) => _parameters(p, null);
+
+  (double, double) _parameters(
+    Vector3 p,
+    List<(double, double, Vector3)>? samples,
+  ) {
     var best = (u0, v0), bestD = double.infinity;
     final seeds = <(double, double, double)>[];
-    for (var i = 0; i <= 6; i++) {
-      for (var j = 0; j <= 6; j++) {
-        final u = u0 + (u1 - u0) * i / 6, v = v0 + (v1 - v0) * j / 6;
-        seeds.add((u, v, (evaluate(u, v) - p).length2));
-      }
+    final grid = samples ?? _parameterSamples();
+    for (final sample in grid) {
+      seeds.add((sample.$1, sample.$2, (sample.$3 - p).length2));
     }
     seeds.sort((a, b) => a.$3.compareTo(b.$3));
     for (final seed in seeds.take(4)) {
       var u = seed.$1, v = seed.$2;
       for (var k = 0; k < 32; k++) {
-        final q = evaluate(u, v),
-            r = q - p,
-            x = du(u, v),
-            y = dv(u, v),
+        final (q, x, y) = jet(u, v);
+        final r = q - p,
             xx = x.length2,
             xy = x.dot(y),
             yy = y.length2,
@@ -440,6 +443,27 @@ class BrepSplineSurface implements BrepSurface {
       }
     }
     return best;
+  }
+
+  // A uniform grid can alias a multi-turn thread to the wrong revolution.
+  // Include every knot span so each polynomial patch can seed the inverse.
+  List<(double, double, Vector3)> _parameterSamples() {
+    List<double> stations(List<double> knots, double start, double end) {
+      final values = <double>{
+        for (var i = 0; i <= 6; i++) start + (end - start) * i / 6,
+      };
+      for (var i = 0; i + 1 < knots.length; i++) {
+        final a = knots[i], b = knots[i + 1];
+        if (a < start || b > end || b <= a) continue;
+        values.addAll([a, (a + b) * .5, b]);
+      }
+      return values.toList()..sort();
+    }
+
+    return [
+      for (final u in stations(knotsU, u0, u1))
+        for (final v in stations(knotsV, v0, v1)) (u, v, evaluate(u, v)),
+    ];
   }
 
   @override
@@ -477,4 +501,15 @@ class BrepSplineSurface implements BrepSurface {
         knotsV: _splineDoubles(j['kv']),
         weights: [for (final row in j['weights'] as List) _splineDoubles(row)],
       );
+}
+
+/// Reuses seed positions within one tessellation/operation. The surface itself
+/// retains no cache, so caller edits to exposed control points cannot stale it.
+class BrepSplineSurfaceLocator {
+  BrepSplineSurfaceLocator(this.surface)
+    : samples = surface._parameterSamples();
+  final BrepSplineSurface surface;
+  final List<(double, double, Vector3)> samples;
+  (double, double) parameters(Vector3 point) =>
+      surface._parameters(point, samples);
 }

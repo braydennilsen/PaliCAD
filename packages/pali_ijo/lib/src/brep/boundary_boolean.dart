@@ -9,6 +9,7 @@ import 'tessellate.dart';
 import 'provenance.dart';
 import 'spline_convert.dart';
 import 'spline_intersect.dart';
+import 'curve_equivalence.dart';
 import '../measure/bounds.dart';
 import '../ijo_log.dart';
 
@@ -69,6 +70,16 @@ class BrepBoundaryBoolean {
         final ba = boundsA[fa], bb = boundsB[fb];
         if (ba != null && bb != null && !ba.intersects(bb, tolerance: 1e-7))
           continue;
+        if ((fa.surface is BrepSplineSurface ||
+                fb.surface is BrepSplineSurface) &&
+            ba != null &&
+            bb != null &&
+            _boundaryBoundsContact(ba, bb)) {
+          continue;
+        }
+        if (BrepSplineIntersect.boundaryContactOnly(fa.surface, fb.surface)) {
+          continue;
+        }
         final curves = _intersections(fa.surface, fb.surface);
         for (final rawCurve in curves) {
           final curve = rawCurve is BrepLine
@@ -783,6 +794,189 @@ class BrepBoundaryBoolean {
     }
   }
 
+  // Finite rational charts retain the exact torus while avoiding ambiguous
+  // periodic branches in the face arrangement after a general plane cut.
+  static bool _appendTorusPatches(
+    BrepBuilder b,
+    BrepSolid solid,
+    BrepFace face,
+  ) {
+    final tor = face.surface as BrepTorus;
+    for (final loop in face.loops)
+      for (final co in loop.coedges) {
+        final curve = solid.edges[co.edge].curve;
+        if (curve is! BrepCircle) return false;
+        final uv = [
+          for (final t in [0.0, .25, .5, .75, 1.0])
+            tor.parameters(
+              curve.evaluate(curve.t0 + (curve.t1 - curve.t0) * t),
+            )!,
+        ];
+        bool constant(bool u) => uv.every(
+          (q) =>
+              math
+                  .sin(
+                    ((u ? q.$1 : q.$2) - (u ? uv.first.$1 : uv.first.$2)) / 2,
+                  )
+                  .abs() <
+              1e-7,
+        );
+        if (!constant(true) && !constant(false)) return false;
+      }
+    final domain =
+        BrepTessellate.torusFaceDomain(solid, tor, face) ??
+        (0.0, 2 * math.pi, 0.0, 2 * math.pi);
+    final nu = math.max(1, ((domain.$2 - domain.$1) / (math.pi / 2)).ceil());
+    final nv = math.max(1, ((domain.$4 - domain.$3) / (math.pi / 2)).ceil());
+    BrepCircle unit(double a, double z) => BrepCircle(
+      center: Vector3.zero(),
+      normal: Vector3(0, 0, 1),
+      xDir: Vector3(1, 0, 0),
+      radius: 1,
+      t0: a,
+      t1: z,
+    );
+    BrepCircle latitude(double v, double a, double z) => BrepCircle(
+      center: tor.center + tor.axis * (tor.minorRadius * math.sin(v)),
+      normal: tor.axis,
+      xDir: tor.xDir,
+      radius: tor.majorRadius + tor.minorRadius * math.cos(v),
+      t0: a,
+      t1: z,
+    );
+    BrepCircle meridian(double u, double a, double z) {
+      final radial = tor.xDir * math.cos(u) + tor.yDir * math.sin(u);
+      return BrepCircle(
+        center: tor.center + radial * tor.majorRadius,
+        normal: radial.cross(tor.axis),
+        xDir: radial,
+        radius: tor.minorRadius,
+        t0: a,
+        t1: z,
+      );
+    }
+
+    for (var i = 0; i < nu; i++)
+      for (var j = 0; j < nv; j++) {
+        final u0 = domain.$1 + (domain.$2 - domain.$1) * i / nu,
+            u1 = domain.$1 + (domain.$2 - domain.$1) * (i + 1) / nu;
+        final v0 = domain.$3 + (domain.$4 - domain.$3) * j / nv,
+            v1 = domain.$3 + (domain.$4 - domain.$3) * (j + 1) / nv;
+        final u = BrepSplineConvert.curve(unit(u0, u1)),
+            v = BrepSplineConvert.curve(unit(v0, v1));
+        final patch = BrepSplineSurface(
+          degreeU: 2,
+          degreeV: 2,
+          knotsU: u.knots,
+          knotsV: v.knots,
+          points: [
+            for (final a in u.points)
+              [
+                for (final c in v.points)
+                  tor.center +
+                      (tor.xDir * a.x + tor.yDir * a.y) *
+                          (tor.majorRadius + tor.minorRadius * c.x) +
+                      tor.axis * (tor.minorRadius * c.y),
+              ],
+          ],
+          weights: [
+            for (final a in u.weights) [for (final c in v.weights) a * c],
+          ],
+        );
+        final curves = [
+          latitude(v0, u0, u1),
+          meridian(u1, v0, v1),
+          latitude(v1, u0, u1),
+          meridian(u0, v0, v1),
+        ];
+        final uses = <BrepCoedge>[];
+        for (var k = 0; k < 4; k++) {
+          final c = curves[k];
+          uses.add(
+            BrepCoedge(
+              b.edge(b.vertex(c.evaluate(c.t0)), b.vertex(c.evaluate(c.t1)), c),
+              reversed: k >= 2,
+            ),
+          );
+        }
+        b.face(
+          patch,
+          [BrepLoop(uses)],
+          reversed: face.reversed,
+          origin: face.origin,
+        );
+      }
+    return true;
+  }
+
+  static bool _appendClosedRuledPatches(
+    BrepBuilder b,
+    BrepSolid s,
+    BrepFace f,
+  ) {
+    final surface = f.surface;
+    if (surface is! BrepRuledSurface) return false;
+    final uses = f.loops.expand((l) => l.coedges).toList();
+    final seams = uses
+        .where((co) => s.edges[co.edge].curve is BrepLine)
+        .toList();
+    final separateRims =
+        f.loops.length == 2 && f.loops.every((l) => l.coedges.length == 1);
+    final sewnSeam =
+        f.loops.length == 1 &&
+        uses.length == 4 &&
+        seams.length == 2 &&
+        seams[0].edge == seams[1].edge &&
+        seams[0].reversed != seams[1].reversed;
+    if (!separateRims && !sewnSeam) return false;
+    final lower = surface.lower, upper = surface.upper;
+    if (lower.evaluate(lower.t0).distanceTo(lower.evaluate(lower.t1)) > 1e-8 ||
+        upper.evaluate(upper.t0).distanceTo(upper.evaluate(upper.t1)) > 1e-8)
+      return false;
+    bool matches(BrepCurve a, BrepCurve b) =>
+        sameRationalCurve(a, b) || sameRationalCurve(a, b, reversed: true);
+    final rims = [
+      for (final co in uses)
+        if (s.edges[co.edge].curve is! BrepLine) s.edges[co.edge].curve,
+    ];
+    if (rims.length != 2) return false;
+    if (!(matches(rims[0], lower) && matches(rims[1], upper) ||
+        matches(rims[1], lower) && matches(rims[0], upper)))
+      return false;
+    // Two closed rims have zero area in a periodic UV chart. Give the
+    // arrangement finite charts just as for circular cylinders, preserving
+    // exact rational rails and shared seam points instead of dropping the wall.
+    for (var i = 0; i < 4; i++) {
+      BrepCurve part(BrepCurve c) => _trim(
+        c,
+        c.t0 + (c.t1 - c.t0) * i / 4,
+        c.t0 + (c.t1 - c.t0) * (i + 1) / 4,
+      );
+      final a = part(lower), z = part(upper);
+      final p = [
+        a.evaluate(a.t0),
+        a.evaluate(a.t1),
+        z.evaluate(z.t1),
+        z.evaluate(z.t0),
+      ];
+      final ids = p.map(b.vertex).toList();
+      b.face(
+        BrepRuledSurface(a, z),
+        [
+          BrepLoop([
+            BrepCoedge(b.edge(ids[0], ids[1], a)),
+            BrepCoedge(b.edge(ids[1], ids[2], BrepLine(p[1], p[2]))),
+            BrepCoedge(b.edge(ids[3], ids[2], z), reversed: true),
+            BrepCoedge(b.edge(ids[3], ids[0], BrepLine(p[3], p[0]))),
+          ]),
+        ],
+        reversed: f.reversed,
+        origin: f.origin,
+      );
+    }
+    return true;
+  }
+
   static BrepSolid _faces(BrepSolid s, BrepSolid other) {
     final b = BrepBuilder();
     for (final v in s.vertices) {
@@ -793,6 +987,8 @@ class BrepBoundaryBoolean {
     }
     for (final f in s.faces) {
       final surface = f.surface;
+      if (_appendClosedRuledPatches(b, s, f)) continue;
+      if (surface is BrepTorus && _appendTorusPatches(b, s, f)) continue;
       if (surface is BrepSphere &&
           BrepTessellate.sphereFaceFrame(s, f) == null &&
           other.faces.any((of) => facesIntersect(s, f, other, of))) {
@@ -890,6 +1086,18 @@ class BrepBoundaryBoolean {
     return b.build();
   }
 
+  // Opposite support bounds meet only on face boundaries. Existing boundary
+  // edges are already split and classified by the collector below.
+  static bool _boundaryBoundsContact(IjoBounds a, IjoBounds b) {
+    for (var i = 0; i < 3; i++) {
+      if ((a.max[i] - b.min[i]).abs() < 1e-8 ||
+          (b.max[i] - a.min[i]).abs() < 1e-8) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   static IjoBounds? _faceBounds(BrepSolid solid, BrepFace face) {
     if (face.surface is BrepRuledSurface) {
       final s = face.surface as BrepRuledSurface;
@@ -946,6 +1154,31 @@ class BrepBoundaryBoolean {
     if (a is BrepRuledSurface && b is BrepRuledSurface) {
       final helices = _helicalPair(a, b);
       if (helices != null) return helices;
+      Vector3? extrusionAxis(BrepRuledSurface s) {
+        final shift =
+            s.upper.evaluate(s.upper.t0) - s.lower.evaluate(s.lower.t0);
+        if (shift.length < 1e-9 ||
+            !sameRationalCurve(s.lower, s.upper, translation: shift)) {
+          return null;
+        }
+        return shift.normalized();
+      }
+
+      final ax = extrusionAxis(a), bx = extrusionAxis(b);
+      if (ax != null &&
+          bx != null &&
+          ax.cross(bx).length < 1e-10 &&
+          (sameRationalCurve(a.lower, b.lower, ignoreAxis: ax) ||
+              sameRationalCurve(
+                a.lower,
+                b.lower,
+                ignoreAxis: ax,
+                reversed: true,
+              ))) {
+        // Coincident swept walls have no isolated intersection curve. Their
+        // finite cap boundaries split them before material-side classification.
+        return [];
+      }
     }
     if (a is BrepRuledSurface && b is BrepPlane) return _ruledPlane(a, b);
     if (b is BrepRuledSurface && a is BrepPlane) return _ruledPlane(b, a);

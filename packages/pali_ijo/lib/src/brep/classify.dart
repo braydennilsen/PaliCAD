@@ -78,19 +78,45 @@ class BrepClassify {
   }
 
   static List<List<Vector3>> _trimPolygons(BrepSolid solid, BrepFace face) {
-    List<List<Vector3>> build() => [
-      for (final loop in face.loops)
-        [
-          for (final p in BrepTessellate.sampleLoop(solid, loop, 64))
-            () {
+    List<List<Vector3>> build() {
+      final period = _closedRuledUPeriod(face.surface);
+      return [
+        for (final loop in face.loops)
+          () {
+            final points = <Vector3>[];
+            for (final p in BrepTessellate.sampleLoop(solid, loop, 64)) {
               final uv = face.surface.parameters(p)!;
-              return Vector3(uv.$1, uv.$2, 0);
-            }(),
-        ],
-    ];
+              var u = uv.$1;
+              // The two sides of a closed sweep's seam occupy the same world
+              // points but different UVs. Keep the wire continuous in its chart;
+              // otherwise it cuts diagonally across the wall and loses material.
+              if (period != null && points.isNotEmpty) {
+                u += ((points.last.x - u) / period).round() * period;
+              }
+              points.add(Vector3(u, uv.$2, 0));
+            }
+            return points;
+          }(),
+      ];
+    }
+
     final cache = _trimCache;
     if (cache == null) return build();
     return (cache[solid] ??= {}).putIfAbsent(face, build);
+  }
+
+  static double? _closedRuledUPeriod(BrepSurface surface) {
+    final ruled = surface is BrepRuledSurface
+        ? surface
+        : surface is BrepSplineSurface
+        ? surface.ruled
+        : null;
+    if (ruled == null ||
+        (ruled.evaluate(0, 0) - ruled.evaluate(1, 0)).length > 1e-8 ||
+        (ruled.evaluate(0, 1) - ruled.evaluate(1, 1)).length > 1e-8) {
+      return null;
+    }
+    return surface is BrepSplineSurface ? surface.u1 - surface.u0 : 1;
   }
 
   static bool isInside(BrepSolid solid, Vector3 p, {double onTol = 1e-6}) {
@@ -492,9 +518,21 @@ class BrepClassify {
         face.loops.isNotEmpty) {
       final uv = s.parameters(q)!;
       var inside = false;
+      final period = _closedRuledUPeriod(s);
       for (final poly in _trimPolygons(solid, face)) {
-        if (_inPoly(poly, Vector3(uv.$1, uv.$2, 0), Vector3(0, 0, 1)))
+        var u = uv.$1;
+        if (period != null && poly.isNotEmpty) {
+          final center = poly.fold(0.0, (double a, p) => a + p.x) / poly.length;
+          u += ((center - u) / period).round() * period;
+        }
+        bool contains(double x) =>
+            _inPoly(poly, Vector3(x, uv.$2, 0), Vector3(0, 0, 1));
+        // Unequal sampling can bias a full-period polygon's mean away from
+        // its midpoint. Check adjacent charts too, so neither seam side is lost.
+        if (contains(u) ||
+            period != null && (contains(u - period) || contains(u + period))) {
           inside = !inside;
+        }
       }
       if (!inside) {
         Vector3? best;

@@ -1,12 +1,62 @@
+import 'dart:math' as math;
+
 import 'package:vector_math/vector_math_64.dart';
 
 import 'geom.dart';
 import 'solid.dart';
 
+part 'xform_editing.dart';
+
 class BrepXform {
   BrepXform._();
 
+  /// Expose exact world-space primitives for dimensioned editing. This also
+  /// accepts older saved affine wrappers, preserving topology and provenance.
+  /// Nonuniform scaling must not be undone before applying millimetre offsets.
+  /// Editors that already handle affine spline sweeps can preserve their
+  /// boundary/display parameterization with [preserveAffineSweeps].
+  static BrepSolid materializeForEditing(
+    BrepSolid solid, {
+    bool preserveAffineSweeps = false,
+  }) => _materializeForEditing(solid, preserveAffineSweeps);
+
   static BrepSolid translate(BrepSolid s, Vector3 d) => map(s, (p) => p + d);
+
+  /// Place a CAD instance without wrapping its analytic faces in a generic
+  /// affine surface. Native plane/cylinder/cone editing remains available.
+  static BrepSolid rigid(BrepSolid solid, BrepAffineTransform transform) {
+    final x = transform.x, y = transform.y, z = transform.z;
+    if ((x.length2 - 1).abs() > 1e-9 ||
+        (y.length2 - 1).abs() > 1e-9 ||
+        (z.length2 - 1).abs() > 1e-9 ||
+        x.dot(y).abs() > 1e-9 ||
+        x.dot(z).abs() > 1e-9 ||
+        y.dot(z).abs() > 1e-9 ||
+        transform.determinant < 0) {
+      throw BrepUnsupported('Rigid placement requires a proper rotation');
+    }
+    return BrepSolid(
+      vertices: [for (final p in solid.vertices) transform.point(p)],
+      edges: [
+        for (final e in solid.edges)
+          BrepEdge(
+            v0: e.v0,
+            v1: e.v1,
+            curve: _mapCurve(e.curve, transform.point),
+            origin: e.origin,
+          ),
+      ],
+      faces: [
+        for (final f in solid.faces)
+          BrepFace(
+            surface: _mapSurface(f.surface, transform.point),
+            loops: f.loops,
+            reversed: f.reversed,
+            origin: f.origin,
+          ),
+      ],
+    );
+  }
 
   /// Applies [f] to every vertex, curve and surface.
   ///

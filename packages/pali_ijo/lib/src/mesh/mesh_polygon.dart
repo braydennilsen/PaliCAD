@@ -31,10 +31,10 @@ class MeshPolygon {
     final v = nHat.cross(u).normalized();
     final origin = verts[rings.first.first];
 
-    Vector2 uv(int i) {
-      final p = verts[i] - origin;
-      return Vector2(p.dot(u), p.dot(v));
-    }
+    final projected = [
+      for (final p in verts) Vector2((p - origin).dot(u), (p - origin).dot(v)),
+    ];
+    Vector2 uv(int i) => projected[i];
 
     List<int> clean(List<int> ring) {
       final out = <int>[];
@@ -81,8 +81,8 @@ class MeshPolygon {
       return bx.compareTo(ax);
     });
 
-    for (final hole in holes) {
-      final merged = _bridge(outer, hole, uv);
+    for (var i = 0; i < holes.length; i++) {
+      final merged = _bridge(outer, holes[i], uv, holes.skip(i + 1));
       if (merged == null) return const [];
       outer = merged;
     }
@@ -121,7 +121,20 @@ class MeshPolygon {
     List<int> outer,
     List<int> hole,
     Vector2 Function(int) uv,
+    Iterable<List<int>> pendingHoles,
   ) {
+    // Openings can meet at a vertex. Join their boundary walks there; adding
+    // a second bridge leaves a zero-area cycle that cannot be ear-clipped.
+    for (var oi = 0; oi < outer.length; oi++) {
+      for (var hi = 0; hi < hole.length; hi++) {
+        if ((uv(outer[oi]) - uv(hole[hi])).length2 > 1e-20) continue;
+        return [
+          ...outer.take(oi + 1),
+          for (var k = 1; k <= hole.length; k++) hole[(hi + k) % hole.length],
+          ...outer.skip(oi + 1),
+        ];
+      }
+    }
     var hi = 0;
     var hx = uv(hole[0]).x;
     for (var i = 1; i < hole.length; i++) {
@@ -155,10 +168,25 @@ class MeshPolygon {
       final r = b - a;
       final s = d - c;
       final den = r.x * s.y - r.y * s.x;
-      if (den.abs() < 1e-14) return false;
+      if (den.abs() < 1e-14) {
+        // A bridge along an earlier hole edge creates an overlapping wire,
+        // even though there is no proper crossing. Aligned lettering and
+        // repeated holes commonly have exactly these collinear candidates.
+        if ((r.x * (c.y - a.y) - r.y * (c.x - a.x)).abs() >
+            _turnTolerance(a, b, c))
+          return false;
+        final length2 = r.length2;
+        if (length2 < 1e-24) return true;
+        final t0 = (c - a).dot(r) / length2;
+        final t1 = (d - a).dot(r) / length2;
+        return math.max(0, math.min(t0, t1)) <
+            math.min(1, math.max(t0, t1)) - 1e-10;
+      }
       final t = ((c.x - a.x) * s.y - (c.y - a.y) * s.x) / den;
       final u = ((c.x - a.x) * r.y - (c.y - a.y) * r.x) / den;
-      return t > 1e-8 && t < 1 - 1e-8 && u > 1e-8 && u < 1 - 1e-8;
+      // Touching a third vertex in the interior of the bridge also splits
+      // the polygon unless explicitly represented as a junction.
+      return t > 1e-8 && t < 1 - 1e-8 && u >= -1e-10 && u <= 1 + 1e-10;
     }
 
     bool blocked(int oi) {
@@ -173,7 +201,7 @@ class MeshPolygon {
         return false;
       }
 
-      return hitRing(outer) || hitRing(hole);
+      return hitRing(outer) || hitRing(hole) || pendingHoles.any(hitRing);
     }
 
     var best = -1;
@@ -183,10 +211,10 @@ class MeshPolygon {
           !entersMaterial(hole, hi, uv(outer[i]))) {
         continue;
       }
-      if (blocked(i)) continue;
       final d = (uv(outer[i]) - hp).length2;
       final preferRight = uv(outer[i]).x + 1e-9 < hx ? 1e6 : 0.0;
       final score = d + preferRight;
+      if (score >= bestScore || blocked(i)) continue;
       if (score < bestScore) {
         bestScore = score;
         best = i;

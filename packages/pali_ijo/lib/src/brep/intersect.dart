@@ -530,9 +530,7 @@ class BrepIntersect {
       ];
     }
     if (!_planeMeetsTorus(a, b)) return const [];
-    throw BrepUnsupported(
-      'Torus–plane intersection (non-principal) is not implemented yet',
-    );
+    return BrepSplineIntersect.intersect(a, b);
   }
 
   static bool _planeMeetsTorus(BrepPlane pl, BrepTorus tor) {

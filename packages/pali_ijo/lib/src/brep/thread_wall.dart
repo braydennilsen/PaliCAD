@@ -11,6 +11,162 @@ import 'primitives.dart';
 /// Work is proportional to the number of turns, without repeated booleans.
 /// Parts with interrupted walls continue through the general intersection path.
 class BrepThreadWall {
+  static double? _angleInInterval(double angle, double a, double b) {
+    final lo = math.min(a, b), hi = math.max(a, b);
+    final t = angle + ((lo - angle) / (2 * math.pi)).ceil() * 2 * math.pi;
+    return t <= hi ? t : null;
+  }
+
+  // Conservative support bounds, never tessellation/sample-based clearance.
+  // Unknown curves return -infinity and retain the general trimming path.
+  static double _support(BrepCurve c, Vector3 origin, Vector3 direction) {
+    if (c is BrepLine) {
+      return math.min(
+        (c.a - origin).dot(direction),
+        (c.b - origin).dot(direction),
+      );
+    }
+    if (c is BrepCircle) {
+      final x = c.xDir.dot(direction), y = c.yDir.dot(direction);
+      final t = _angleInInterval(math.atan2(y, x) + math.pi, c.t0, c.t1);
+      final minimum = math.min(
+        x * math.cos(c.t0) + y * math.sin(c.t0),
+        x * math.cos(c.t1) + y * math.sin(c.t1),
+      );
+      return (c.center - origin).dot(direction) +
+          c.radius * (t == null ? minimum : -math.sqrt(x * x + y * y));
+    }
+    if (c is BrepHelix) {
+      final x = c.xDir.dot(direction), y = c.yDir.dot(direction);
+      final axial = c.axis.dot(direction) * c.lead / (2 * math.pi);
+      return (c.origin - origin).dot(direction) +
+          math.min(axial * c.t0, axial * c.t1) -
+          math.max(c.radiusAt(c.t0), c.radiusAt(c.t1)) *
+              math.sqrt(x * x + y * y);
+    }
+    if (c is BrepPlaneSectionCurve &&
+        c.t0 >= 0 &&
+        c.t0 <= 1 &&
+        c.t1 >= 0 &&
+        c.t1 <= 1) {
+      final a = c.surface.lower, b = c.surface.upper;
+      if (a is BrepHelix &&
+          b is BrepHelix &&
+          c.plane.normal.cross(a.axis).length < 1e-10 &&
+          c.plane.normal.cross(b.axis).length < 1e-10) {
+        // With an axial cutting plane the ruling is linear-fractional in u.
+        // Same-sign denominators bound v by its endpoint values. Bound the
+        // linear interpolation too, including any extrapolation beyond rails.
+        final d0 = c.surface.dv(c.t0, 0).dot(c.plane.normal);
+        final d1 = c.surface.dv(c.t1, 0).dot(c.plane.normal);
+        if (d0 * d1 > 0 && d0.abs() > 1e-12 && d1.abs() > 1e-12) {
+          final v0 = c.ruling(c.t0), v1 = c.ruling(c.t1);
+          final amin = _support(a, origin, direction);
+          final amax = -_support(a, origin, -direction);
+          final bmin = _support(b, origin, direction);
+          final bmax = -_support(b, origin, -direction);
+          double bound(double v) =>
+              (1 - v) * (v <= 1 ? amin : amax) + v * (v >= 0 ? bmin : bmax);
+          return math.min(bound(v0), bound(v1));
+        }
+      }
+    }
+    return double.negativeInfinity;
+  }
+
+  static Vector3 _radialDirection(Vector3 p, Vector3 origin, Vector3 axis) {
+    final delta = p - origin;
+    return (delta - axis * delta.dot(axis)).normalized();
+  }
+
+  static Vector3 _curveAnchor(BrepCurve c) => switch (c) {
+    BrepHelix() => c.origin,
+    BrepCircle() => c.center,
+    BrepPlaneSectionCurve() => _curveAnchor(c.surface.lower),
+    _ => c.evaluate((c.t0 + c.t1) / 2),
+  };
+
+  static bool _curveOutsideBore(
+    BrepCurve c,
+    Vector3 origin,
+    Vector3 axis,
+    double radius,
+  ) {
+    if (c is BrepCircle && c.normal.cross(axis).length < 1e-10) {
+      // The closest point on a trimmed arc is an endpoint or the radial
+      // stationary point. Its unused supporting circle is not an obstruction.
+      final delta = origin - c.center;
+      final t = _angleInInterval(
+        math.atan2(delta.dot(c.yDir), delta.dot(c.xDir)),
+        c.t0,
+        c.t1,
+      );
+      return [c.t0, c.t1, if (t != null) t].every(
+        (u) => (c.evaluate(u) - origin).cross(axis).length > radius + 1e-7,
+      );
+    }
+    final direction = _radialDirection(_curveAnchor(c), origin, axis);
+    return _support(c, origin, direction) > radius + 1e-7;
+  }
+
+  static bool _outsideBore(
+    BrepSolid body,
+    BrepFace face,
+    Vector3 origin,
+    Vector3 axis,
+    double radius,
+  ) {
+    final surface = face.surface;
+    if (surface is BrepCylinder && surface.axis.cross(axis).length < 1e-10) {
+      // For a bounded parallel-axis cylindrical patch, every angular station reaches
+      // its boundary. Circular rims and axial seams therefore bound the entire
+      // wall, including split/partial cylinders, without sampling its surface.
+      final edges = face.loops.expand((l) => l.coedges).toList();
+      return edges.any((co) => body.edges[co.edge].curve is BrepCircle) &&
+          edges.every((co) {
+            final c = body.edges[co.edge].curve;
+            if (c is BrepCircle &&
+                c.normal.cross(axis).length < 1e-10 &&
+                (c.center - surface.origin).cross(axis).length < 1e-7 &&
+                (c.radius - surface.radius).abs() < 1e-7) {
+              return _curveOutsideBore(c, origin, axis, radius);
+            }
+            if (c is BrepLine && (c.b - c.a).cross(axis).length < 1e-10) {
+              return (c.a - origin).cross(axis).length > radius + 1e-7;
+            }
+            return false;
+          });
+    }
+    if (surface is BrepRuledSurface) {
+      final direction = _radialDirection(
+        (_curveAnchor(surface.lower) + _curveAnchor(surface.upper)) / 2,
+        origin,
+        axis,
+      );
+      return math.min(
+            _support(surface.lower, origin, direction),
+            _support(surface.upper, origin, direction),
+          ) >
+          radius + 1e-7;
+    }
+    if (surface is BrepPlane &&
+        face.loops.isNotEmpty &&
+        face.loops.first.coedges.isNotEmpty) {
+      final first = body.edges[face.loops.first.coedges.first.edge].curve;
+      final direction = _radialDirection(_curveAnchor(first), origin, axis);
+      // A single separating half-plane for the whole planar boundary also
+      // separates its interior. Testing each edge independently would not.
+      return face.loops
+          .expand((l) => l.coedges)
+          .every(
+            (co) =>
+                _support(body.edges[co.edge].curve, origin, direction) >
+                radius + 1e-7,
+          );
+    }
+    return false;
+  }
+
   /// Replace a complete external cylindrical wall on a larger planar part.
   /// Adjacent cap/shoulder loops inherit the new helical rim; the head and its
   /// other faces are retained exactly. Interrupted walls use the general CSG.
@@ -248,28 +404,35 @@ class BrepThreadWall {
                   1e-7,
         )
         .toList();
-    if (walls.length != 1 ||
-        body.faces.any(
-          (f) => f.surface is! BrepPlane && f.surface is! BrepCylinder,
-        ))
-      return null;
-    final wall = walls.single, cylinder = wall.surface as BrepCylinder;
+    if (walls.isEmpty) return null;
+    final cylinder = walls.first.surface as BrepCylinder;
     final n = axis.normalized();
     final boreRadius = cylinder.radius;
-    if (!wall.reversed) return null;
-    final wallEdges = {
-      for (final l in wall.loops)
-        for (final c in l.coedges) c.edge,
-    };
+    if (walls.any(
+      (f) => ((f.surface as BrepCylinder).radius - boreRadius).abs() > 1e-7,
+    )) {
+      return null;
+    }
+    // A boolean may split a complete bore at its periodic seam. Treat all
+    // matching patches as one wall, requiring paired longitudinal seams and
+    // one complete circular boundary at each end.
+    final wallEdges = <int, int>{};
+    for (final wall in walls) {
+      for (final co in wall.loops.expand((l) => l.coedges)) {
+        wallEdges.update(co.edge, (n) => n + 1, ifAbsent: () => 1);
+      }
+    }
     final rims = <double, Set<int>>{lo: {}, hi: {}};
-    for (final id in wallEdges) {
+    for (final id in wallEdges.keys) {
       final c = body.edges[id].curve;
       if (c is BrepLine) {
-        if ((c.evaluate(c.t1) - c.evaluate(c.t0)).cross(n).length > 1e-7)
+        if (wallEdges[id] != 2 ||
+            (c.evaluate(c.t1) - c.evaluate(c.t0)).cross(n).length > 1e-7)
           return null;
         continue;
       }
-      if (c is! BrepCircle ||
+      if (wallEdges[id] != 1 ||
+          c is! BrepCircle ||
           (c.radius - boreRadius).abs() > 1e-7 ||
           c.normal.cross(n).length > 1e-8)
         return null;
@@ -291,7 +454,11 @@ class BrepThreadWall {
     }
     final replacements = <BrepFace, (int, double)>{};
     for (final f in body.faces) {
-      if (identical(f, wall)) continue;
+      if (walls.contains(f)) continue;
+      // Existing threads and other separated patches must not force a global
+      // helical boolean. Only skip surfaces with a proven separating bound.
+      if (_outsideBore(body, f, origin, n, majorRadius)) continue;
+      if (f.surface is! BrepPlane && f.surface is! BrepCylinder) return null;
       if (f.surface is BrepCylinder) {
         final c = f.surface as BrepCylinder;
         // Only accept other cylinders entirely outside the swept envelope.
@@ -329,14 +496,15 @@ class BrepThreadWall {
           for (final co in f.loops[i].coedges) {
             final c = body.edges[co.edge].curve;
             if (c is BrepCircle) {
-              final distance = (c.center - origin).cross(n).length;
               if (c.normal.cross(n).length > 1e-8 ||
-                  (distance - c.radius <= majorRadius + 1e-7 &&
-                      c.radius - distance <= majorRadius + 1e-7))
+                  !_curveOutsideBore(c, origin, n, majorRadius))
                 return null;
               continue;
             }
-            if (c is! BrepLine) return null;
+            if (c is! BrepLine) {
+              if (!_curveOutsideBore(c, origin, n, majorRadius)) return null;
+              continue;
+            }
             final a = c.evaluate(c.t0) - origin;
             final b = c.evaluate(c.t1) - origin;
             final p = a - n * a.dot(n), q = b - n * b.dot(n), d = q - p;
@@ -405,7 +573,7 @@ class BrepThreadWall {
     ]);
     final faces = <BrepFace>[];
     for (final f in body.faces) {
-      if (identical(f, wall)) continue;
+      if (walls.contains(f)) continue;
       final replacement = replacements[f];
       final loops = List<BrepLoop>.from(f.loops);
       if (replacement != null) {
@@ -517,6 +685,26 @@ class BrepThreadWall {
     }
 
     BrepCoedge edge(BrepCurve c) {
+      if (c is BrepPlaneSectionCurve) {
+        final a = c.surface.lower, z = c.surface.upper;
+        if (a is BrepHelix &&
+            z is BrepHelix &&
+            a.radiusSlope == 0 &&
+            z.radiusSlope == 0 &&
+            (a.radius - z.radius).abs() < 1e-10 &&
+            c.plane.normal.cross(n).length < 1e-10) {
+          // Constant-radius axial sections are exact circular arcs. Use the
+          // same representation as the adjacent unthreaded wall.
+          c = BrepCircle(
+            center: origin + n * (c.plane.origin - origin).dot(n),
+            normal: n,
+            xDir: a.xDir,
+            radius: a.radius,
+            t0: a.t0 + (a.t1 - a.t0) * c.t0,
+            t1: a.t0 + (a.t1 - a.t0) * c.t1,
+          );
+        }
+      }
       final backward = c.t1 < c.t0;
       if (backward) {
         c = switch (c) {
@@ -681,7 +869,11 @@ class BrepThreadWall {
       for (final p in b.vertices) {
         final delta = p - origin, z = delta.dot(n);
         if ((z - low).abs() > 1e-7 && (z - high).abs() > 1e-7) continue;
-        if (((delta - n * z).length - r).abs() > 1e-7) continue;
+        // Include the angles of the opposite rim too. A partial thread has
+        // a thin planar transition between different radii; a long display
+        // chord on the plain rim can otherwise cross the finer inner rail.
+        // Splitting the exact circle at those angles keeps the cap ordered
+        // even at draft quality, without changing the native surface.
         var t = math.atan2(delta.dot(y), delta.dot(x));
         if (t < 0) t += 2 * math.pi;
         if (t > 1e-8 && t < 2 * math.pi - 1e-8) cuts.add(t);
@@ -733,6 +925,87 @@ class BrepThreadWall {
     if (hi - at > 1e-8) plain(plainRadius, at, hi, internal);
     if (internal) plain(outer, lo, hi, false);
     if (!internal && inner > 0) plain(inner, lo, hi, true);
+    // Opposite ends can introduce different angular splits on the same rim.
+    // Sew coincident circular intervals before walking the remaining cap
+    // boundaries; otherwise they create zero-width overlapping end faces.
+    final circularSplits = <int, List<BrepCoedge>>{};
+    final shared = <(int, int), List<int>>{};
+    final oldEdges = List<BrepEdge>.from(b.edges);
+    for (var id = 0; id < oldEdges.length; id++) {
+      final old = oldEdges[id], c = old.curve;
+      if (c is! BrepCircle) continue;
+      final cuts = <(double, int)>[(c.t0, old.v0), (c.t1, old.v1)];
+      for (var v = 0; v < b.vertices.length; v++) {
+        if (v == old.v0 || v == old.v1) continue;
+        final delta = b.vertices[v] - c.center;
+        if (delta.dot(c.normal).abs() > 1e-7 ||
+            (delta.length - c.radius).abs() > 1e-7)
+          continue;
+        final t = _angleInInterval(
+          math.atan2(delta.dot(c.yDir), delta.dot(c.xDir)),
+          c.t0,
+          c.t1,
+        );
+        if (t != null && t > c.t0 + 1e-8 && t < c.t1 - 1e-8) cuts.add((t, v));
+      }
+      cuts.sort((a, z) => a.$1.compareTo(z.$1));
+      final chain = <BrepCoedge>[];
+      for (var i = 1; i < cuts.length; i++) {
+        final a = cuts[i - 1], z = cuts[i];
+        if (z.$1 - a.$1 < 1e-8) continue;
+        final curve = BrepCircle(
+          center: c.center,
+          normal: c.normal,
+          xDir: c.xDir,
+          radius: c.radius,
+          t0: a.$1,
+          t1: z.$1,
+        );
+        final key = (math.min(a.$2, z.$2), math.max(a.$2, z.$2));
+        final candidates = shared.putIfAbsent(key, () => []);
+        final mid = curve.evaluate((curve.t0 + curve.t1) / 2);
+        final found = candidates.where((e) {
+          final other = b.edges[e].curve;
+          return (other.evaluate((other.t0 + other.t1) / 2) - mid).length <
+              1e-7;
+        }).firstOrNull;
+        final e = found ?? b.edge(a.$2, z.$2, curve);
+        if (found == null) candidates.add(e);
+        chain.add(BrepCoedge(e, reversed: b.edges[e].v0 != a.$2));
+      }
+      circularSplits[id] = chain;
+    }
+    for (var i = 0; i < b.faces.length; i++) {
+      final f = b.faces[i];
+      b.faces[i] = BrepFace(
+        surface: f.surface,
+        reversed: f.reversed,
+        origin: f.origin,
+        loops: [
+          for (final l in f.loops)
+            BrepLoop([
+              for (final co in l.coedges)
+                if (!circularSplits.containsKey(co.edge))
+                  co
+                else ...[
+                  for (final split
+                      in co.reversed
+                          ? circularSplits[co.edge]!.reversed
+                          : circularSplits[co.edge]!)
+                    BrepCoedge(
+                      split.edge,
+                      reversed: split.reversed != co.reversed,
+                    ),
+                ],
+            ]),
+        ],
+      );
+    }
+    uses.clear();
+    for (final f in b.faces) {
+      for (final co in f.loops.expand((l) => l.coedges))
+        (uses[co.edge] ??= []).add(co);
+    }
     final pending = <BrepCoedge>[
       for (final entry in uses.entries)
         if (entry.value.length == 1)

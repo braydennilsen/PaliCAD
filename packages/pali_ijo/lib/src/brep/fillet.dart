@@ -8,12 +8,17 @@ import 'geom.dart';
 import 'chamfer_options.dart';
 import 'profile_blend.dart';
 import 'classify.dart';
+import 'convex_planes.dart';
+import 'intersect.dart';
+import 'slice.dart';
 import 'heal.dart';
 import 'primitives.dart';
 import 'provenance.dart';
 import 'solid.dart';
 import 'tessellate.dart';
 import 'xform.dart';
+
+part 'blend_planar_regions.dart';
 
 /// Analytic fillet / chamfer. Plane–plane → cylinder / plane;
 /// plane–cylinder circular rim → torus / cone.
@@ -33,8 +38,12 @@ class BrepFillet {
     required double radius,
     required bool inverse,
   }) => BrepProvenance.inheritFrom(
-    BrepHeal.sewClosedRims(
-      _fillet(solid, edgeIds, radius: radius, inverse: inverse),
+    BrepHeal.mergeCoplanar(
+      BrepHeal.sewClosedRims(
+        _resolveBlendLineContacts(
+          _fillet(solid, edgeIds, radius: radius, inverse: inverse),
+        ),
+      ),
     ),
     solid,
     op: 'fillet',
@@ -64,11 +73,14 @@ class BrepFillet {
         );
       }
     }
+    solid = BrepXform.materializeForEditing(solid);
     final r = radius;
     if (r < 1e-9) return solid;
     // A Boolean may partition a flat cap into a ring and a coplanar fill.
     // Blend the continuous face before its moved perimeter reaches that seam.
-    solid = BrepHeal.mergeFilledPlanarLoops(solid);
+    solid = _blendPlanarRegions(BrepHeal.mergeFilledPlanarLoops(solid));
+    edgeIds = _creaseEdges(solid, edgeIds);
+    if (edgeIds.isEmpty) return solid;
     final unique = inverse
         ? edgeIds
               .where((id) => id >= 0 && id < solid.edges.length)
@@ -119,7 +131,7 @@ class BrepFillet {
     double distance, {
     ChamferOptions options = const ChamferOptions(),
   }) => BrepProvenance.inheritFrom(
-    _chamfer(solid, edgeIds, distance, options),
+    _resolveBlendLineContacts(_chamfer(solid, edgeIds, distance, options)),
     solid,
     op: 'chamfer',
   );
@@ -148,8 +160,12 @@ class BrepFillet {
         );
       }
     }
+    solid = BrepXform.materializeForEditing(solid);
     final d = distance;
     if (d < 1e-9) return solid;
+    solid = _blendPlanarRegions(BrepHeal.mergeFilledPlanarLoops(solid));
+    edgeIds = _creaseEdges(solid, edgeIds);
+    if (edgeIds.isEmpty) return solid;
     final profile = BrepProfileBlend.tryRun(
       solid,
       edgeIds,
@@ -318,17 +334,19 @@ class BrepFillet {
 
   static List<List<int>> _edgeChains(BrepSolid s, List<int> edgeIds) {
     final wanted = edgeIds.toSet();
-    final adj = <int, List<int>>{};
+    final atVertex = <int, List<int>>{};
     for (final id in wanted) {
       final e = s.edges[id];
-      for (final other in wanted) {
-        if (other == id) continue;
-        final o = s.edges[other];
-        if (e.v0 == o.v0 || e.v0 == o.v1 || e.v1 == o.v0 || e.v1 == o.v1) {
-          adj.putIfAbsent(id, () => []).add(other);
-        }
-      }
+      (atVertex[e.v0] ??= []).add(id);
+      if (e.v1 != e.v0) (atVertex[e.v1] ??= []).add(id);
     }
+    final adj = <int, List<int>>{
+      for (final id in wanted)
+        id: {
+          ...atVertex[s.edges[id].v0]!,
+          ...atVertex[s.edges[id].v1]!,
+        }.where((other) => other != id).toList(),
+    };
     final seen = <int>{};
     final chains = <List<int>>[];
     for (final start in wanted) {
@@ -908,6 +926,16 @@ class BrepFillet {
               s.faces[fi].loops.length != 1 ||
               (fi != faceIndex && s.faces[fi].loops.first.coedges.length != 4),
         )) {
+      if (!round && BrepConvexPlanes.supports(s)) {
+        // Existing bevels change wall topology. Chamfer the requested cap
+        // boundary without re-chamfering completed upright corner edges.
+        return _chamferConvexEdges(
+          s,
+          capSet.toList(),
+          r,
+          const ChamferOptions(),
+        );
+      }
       throw BrepUnsupported(
         'Face-loop blend needs intact prism walls and an opposite cap',
       );
@@ -2178,11 +2206,12 @@ class BrepFillet {
     if (selected.isEmpty) return const [];
 
     final atVertex = <int, List<int>>{};
+    final adjacency = _blendAdjacency(solid);
     for (var id = 0; id < solid.edges.length; id++) {
-      if (facesForEdge(solid, id).length != 2) continue;
+      if (adjacency[id]?.length != 2) continue;
       final e = solid.edges[id];
       if (e.v0 == e.v1) continue;
-      final faces = facesForEdge(solid, id);
+      final faces = adjacency[id]!;
       final mid = e.curve.evaluate((e.curve.t0 + e.curve.t1) * .5);
       final normals = [
         for (final fi in faces)
@@ -2265,6 +2294,11 @@ class BrepFillet {
         return limit == null ? null : limit * scale;
       }
     }
+    s = _blendPlanarRegions(
+      BrepHeal.mergeFilledPlanarLoops(BrepXform.materializeForEditing(s)),
+    );
+    ids = _creaseEdges(s, ids);
+    if (ids.isEmpty) return null;
     final planar = maxPlanarRadius(s, ids);
     if (planar != null) return planar;
     var limit = double.infinity;
@@ -2274,8 +2308,12 @@ class BrepFillet {
       final curve = s.edges[id].curve;
       if (curve is BrepCircle) {
         for (final fi in facesForEdge(s, id)) {
-          if (s.faces[fi].surface is BrepCylinder && !s.faces[fi].reversed)
-            limit = math.min(limit, curve.radius);
+          if (s.faces[fi].surface is BrepCylinder) {
+            final frame = chamferFrame(s, id);
+            if (frame != null && frame.$2.dot(frame.$1 - curve.center) < 0) {
+              limit = math.min(limit, curve.radius);
+            }
+          }
         }
       }
     }
@@ -2296,6 +2334,33 @@ class BrepFillet {
       limit = (hi - lo).length * .5;
     }
     return limit.isFinite && limit > 0 ? limit : null;
+  }
+
+  /// Search bound for planar chamfer setbacks. Short edges left by an earlier
+  /// bevel do not constrain a later bevel: measure travel across each face.
+  /// The operation still checks each requested contact and the resulting solid.
+  static double? maxChamferDistance(BrepSolid s, List<int> ids) {
+    final planar = BrepXform.materializeForEditing(s);
+    if (ids.isEmpty || !BrepConvexPlanes.supports(planar)) {
+      return maxBlendDistance(s, ids);
+    }
+    var limit = double.infinity;
+    for (final id in ids.toSet()) {
+      final frame = chamferFrame(planar, id);
+      if (frame == null) return maxBlendDistance(s, ids);
+      for (final direction in [frame.$2, frame.$3]) {
+        for (final face in planar.faces) {
+          final n = face.outwardNormal(0, 0);
+          final rate = n.dot(direction);
+          if (rate <= 1e-10) continue;
+          final remaining = n.dot(
+            (face.surface as BrepPlane).origin - frame.$1,
+          );
+          limit = math.min(limit, remaining / rate);
+        }
+      }
+    }
+    return limit.isFinite && limit > 0 ? limit : maxBlendDistance(s, ids);
   }
 
   /// Local radius bound for straight edges between planar faces. Returns null
@@ -2419,6 +2484,7 @@ class BrepFillet {
         (m.point(local.$1 + local.$3) - origin).normalized(),
       );
     }
+    s = BrepXform.materializeForEditing(s);
     final edge = s.edges[edgeId];
     final adj = facesForEdge(s, edgeId);
     if (adj.length != 2) return null;
@@ -2438,6 +2504,26 @@ class BrepFillet {
       return n.cross(co.reversed ? -t : t).normalized();
     }
 
+    if (edge.curve is BrepCircle) {
+      final plane = adj
+          .where((fi) => s.faces[fi].surface is BrepPlane)
+          .firstOrNull;
+      final cylinder = adj
+          .where((fi) => s.faces[fi].surface is BrepCylinder)
+          .firstOrNull;
+      if (plane != null && cylinder != null) {
+        final cap = s.faces[plane], wall = s.faces[cylinder];
+        final uv = wall.surface.parameters(p)!;
+        final radial = wall.outwardNormal(uv.$1, uv.$2);
+        final step = math.max(1e-5, (edge.curve as BrepCircle).radius * 1e-5);
+        final minus = BrepClassify.containsPlaneFace(s, cap, p - radial * step);
+        final plus = BrepClassify.containsPlaneFace(s, cap, p + radial * step);
+        if (minus != plus && minus != null && plus != null) {
+          final sign = minus ? -1.0 : 1.0;
+          return (p, radial * sign, cap.outwardNormal(0, 0) * sign);
+        }
+      }
+    }
     var first = adj[0], second = adj[1];
     if (edge.curve is BrepCircle && s.faces[second].surface is BrepPlane) {
       first = adj[1];
@@ -2473,6 +2559,10 @@ class BrepFillet {
         ? f2
         : null;
     if (plane != null && cyl != null && e.curve is BrepCircle) {
+      if (!(e.curve as BrepCircle).isClosed && !inverse) {
+        final clipped = _blendClippedCylinder(s, edgeId, r, round: true);
+        if (clipped != null) return clipped;
+      }
       return _filletPlaneCylinder(s, edgeId, plane, cyl, r, inverse: inverse);
     }
     final cone = f1.surface is BrepCone
@@ -2516,6 +2606,16 @@ class BrepFillet {
         ? f2
         : null;
     if (plane != null && cyl != null && e.curve is BrepCircle) {
+      if (!(e.curve as BrepCircle).isClosed) {
+        final clipped = _blendClippedCylinder(
+          s,
+          edgeId,
+          d,
+          round: false,
+          options: options,
+        );
+        if (clipped != null) return clipped;
+      }
       return _chamferPlaneCylinder(s, edgeId, plane, cyl, d, options);
     }
     final cone = f1.surface is BrepCone
@@ -2704,10 +2804,14 @@ class BrepFillet {
     bool round = true,
   }) {
     final e = s.edges[edgeId];
-    final a = s.vertices[e.v0];
-    final b = s.vertices[e.v1];
     final v0 = e.v0;
     final v1 = e.v1;
+    final endA = _blendEndPlane(s, edgeId, i1, i2, v0, cyl.axis);
+    final endB = _blendEndPlane(s, edgeId, i1, i2, v1, cyl.axis);
+    a1 = _clipBlendContact(a1, cyl.axis, endA);
+    a2 = _clipBlendContact(a2, cyl.axis, endA);
+    b1 = _clipBlendContact(b1, cyl.axis, endB);
+    b2 = _clipBlendContact(b2, cyl.axis, endB);
     final bld = BrepBuilder();
     int copyV(Vector3 p) {
       for (var i = 0; i < bld.vertices.length; i++) {
@@ -2771,18 +2875,7 @@ class BrepFillet {
     if (tB - tA > math.pi) tB -= math.pi * 2;
     if (majorArc) tB += (tB > tA ? -1 : 1) * math.pi * 2;
     final arcA = round
-        ? sew(
-            va1,
-            va2,
-            BrepCircle(
-              center: cyl.origin,
-              normal: cyl.axis,
-              radius: rFor(cyl),
-              xDir: cyl.xDir,
-              t0: tA,
-              t1: tB,
-            ),
-          ).$1
+        ? sew(va1, va2, _blendEndCurve(cyl, endA, a1, a2, tA, tB)).$1
         : sew(va1, va2, BrepLine(a1, a2)).$1;
     var tA1 = _cylU(cyl, b1);
     var tB1 = _cylU(cyl, b2);
@@ -2790,18 +2883,7 @@ class BrepFillet {
     if (tB1 - tA1 > math.pi) tB1 -= math.pi * 2;
     if (majorArc) tB1 += (tB1 > tA1 ? -1 : 1) * math.pi * 2;
     final arcB = round
-        ? sew(
-            vb1,
-            vb2,
-            BrepCircle(
-              center: cyl.origin + cyl.axis * (b - a).length,
-              normal: cyl.axis,
-              radius: rFor(cyl),
-              xDir: cyl.xDir,
-              t0: tA1,
-              t1: tB1,
-            ),
-          ).$1
+        ? sew(vb1, vb2, _blendEndCurve(cyl, endB, b1, b2, tA1, tB1)).$1
         : sew(vb1, vb2, BrepLine(b1, b2)).$1;
 
     bool usesVertex(BrepFace face, int v) {
@@ -2990,11 +3072,33 @@ class BrepFillet {
         ),
       );
     }
-    final into = inverse ? nCap : -nCap;
-    final radialSign = cylFace.reversed ? -1.0 : 1.0;
-    final major = cyl.radius + (inverse ? radialSign : -radialSign) * r;
-    if (major < 1e-6) {
+    final frame = chamferFrame(s, edgeId)!;
+    final radial = (frame.$1 - circle.center).normalized();
+    final into = frame.$3;
+    final major = cyl.radius + frame.$2.dot(radial).sign * r;
+    if (major < -1e-7) {
       throw BrepUnsupported('Fillet radius too large for cylinder');
+    }
+    if (major.abs() <= 1e-7) {
+      return _rebuildCircularRim(
+        s,
+        edgeId,
+        s.faces.indexOf(planeFace),
+        s.faces.indexOf(cylFace),
+        BrepCircle(
+          center: circle.center,
+          normal: circle.normal,
+          radius: 0,
+          xDir: circle.xDir,
+        ),
+        BrepCircle(
+          center: circle.center + into * r,
+          normal: circle.normal,
+          radius: cyl.radius,
+          xDir: circle.xDir,
+        ),
+        BrepSphere(center: circle.center + into * r, radius: r),
+      );
     }
     final torus = BrepTorus(
       center: circle.center + into * r,
@@ -3054,8 +3158,15 @@ class BrepFillet {
   ) {
     final circle = s.edges[edgeId].curve as BrepCircle;
     final cap = s.faces[planeId], wallFace = s.faces[cylinderId];
-    final n = cap.outwardNormal(0, 0),
-        depth = (circle.center - wall.center).dot(n);
+    final collapsed = inner.radius.abs() < 1e-8;
+    if (collapsed &&
+        (cap.loops.length != 1 || cap.loops.single.coedges.length != 1)) {
+      throw BrepUnsupported('Collapsing circular cap meets another boundary');
+    }
+    final n = cap.outwardNormal(0, 0);
+    final displacement = wall.center - circle.center;
+    final depth = displacement.length;
+    final into = depth > 1e-9 ? displacement / depth : Vector3.zero();
     if (depth <= 1e-9)
       throw BrepUnsupported('Blend must extend into the selected wall');
     for (var i = 0; i < 32; i++) {
@@ -3069,7 +3180,7 @@ class BrepFillet {
         if (co.edge == edgeId) continue;
         final curve = s.edges[co.edge].curve;
         if (curve is BrepCircle) {
-          final available = (circle.center - curve.center).dot(n);
+          final available = (curve.center - circle.center).dot(into);
           if (available > 1e-7 && depth >= available - 1e-7)
             throw BrepUnsupported('Blend reaches the opposite wall boundary');
         }
@@ -3106,7 +3217,10 @@ class BrepFillet {
         for (final co in loop.coedges) {
           if (co.edge == edgeId && fi == planeId) capUse = co;
           if (co.edge == edgeId && fi == cylinderId) {
-            wallUse = BrepCoedge(we, reversed: co.reversed);
+            wallUse = BrepCoedge(
+              we,
+              reversed: collapsed ? wall.normal.dot(n) > 0 : co.reversed,
+            );
             uses.add(wallUse);
           } else {
             uses.add(co);
@@ -3114,7 +3228,8 @@ class BrepFillet {
         }
         loops.add(BrepLoop(uses));
       }
-      b.face(f.surface, loops, reversed: f.reversed, origin: f.origin);
+      if (!collapsed || fi != planeId)
+        b.face(f.surface, loops, reversed: f.reversed, origin: f.origin);
     }
     if (capUse == null || wallUse == null)
       throw BrepUnsupported('Fillet rim has no shared cap and wall');
@@ -3124,7 +3239,8 @@ class BrepFillet {
     final middle = (inner.evaluate(inner.t0) + wall.evaluate(wall.t0)) * .5;
     final blendUv = blend.parameters(middle)!;
     b.face(blend, [
-      BrepLoop([BrepCoedge(edgeId, reversed: !capUse.reversed)]),
+      if (!collapsed)
+        BrepLoop([BrepCoedge(edgeId, reversed: !capUse.reversed)]),
       BrepLoop([BrepCoedge(we, reversed: !wallUse.reversed)]),
     ], reversed: blend.normalAt(blendUv.$1, blendUv.$2).dot(expected) < 0);
     return b.build();
@@ -3138,6 +3254,9 @@ class BrepFillet {
     double d,
     ChamferOptions options,
   ) {
+    if (BrepConvexPlanes.supports(s)) {
+      return _chamferConvexEdges(s, [edgeId], d, options);
+    }
     final e = s.edges[edgeId];
     final f1 = s.faces[i1];
     final f2 = s.faces[i2];
@@ -3151,12 +3270,32 @@ class BrepFillet {
     final b = s.vertices[e.v1];
     final frame = chamferFrame(s, edgeId)!;
     final dir1 = frame.$2, dir2 = frame.$3;
-    final a1 = a + dir1 * d;
-    final b1 = b + dir1 * d;
+    final endA = _blendEndPlane(s, edgeId, i1, i2, e.v0, t);
+    final endB = _blendEndPlane(s, edgeId, i1, i2, e.v1, t);
+    final a1 = _clipBlendContact(a + dir1 * d, t, endA);
+    final b1 = _clipBlendContact(b + dir1 * d, t, endB);
     final beta = math.acos(dir1.dot(dir2).clamp(-1.0, 1.0));
     final d2 = options.secondDistance(d, beta);
-    final a2 = a + dir2 * d2;
-    final b2 = b + dir2 * d2;
+    final a2 = _clipBlendContact(a + dir2 * d2, t, endA);
+    final b2 = _clipBlendContact(b + dir2 * d2, t, endB);
+    var cutNormal = (b1 - a1).cross(a2 - a1);
+    if (cutNormal.dot(n1 + n2) < 0) cutNormal = -cutNormal;
+    if (s.faces.any((f) => f.surface is! BrepPlane) && _isConvexBlendSolid(s)) {
+      final pieces = BrepSlice.parts(s, a1, cutNormal);
+      final kept = pieces
+          .where(
+            (part) =>
+                part.vertices.isNotEmpty &&
+                part.vertices.fold(
+                      0.0,
+                      (sum, p) => sum + (p - a1).dot(cutNormal),
+                    ) <
+                    -1e-7,
+          )
+          .toList();
+      if (kept.length == 1) return kept.single;
+      throw BrepUnsupported('Chamfer would consume the remaining body');
+    }
     if ([
           a1,
           b1,
@@ -3189,6 +3328,56 @@ class BrepFillet {
       blendSurface: plane,
       round: false,
     );
+  }
+
+  static BrepSolid _chamferConvexEdges(
+    BrepSolid s,
+    List<int> edges,
+    double distance,
+    ChamferOptions options,
+  ) {
+    final cuts = <BrepPlane>[];
+    for (final id in edges.toSet()) {
+      final faces = facesForEdge(s, id), frame = chamferFrame(s, id);
+      if (faces.length != 2 || frame == null) {
+        throw BrepUnsupported('Chamfer needs two adjacent planar faces');
+      }
+      final edge = s.edges[id];
+      final a = s.vertices[edge.v0], tangent = s.vertices[edge.v1] - a;
+      final dir1 = frame.$2, dir2 = frame.$3;
+      final d2 = options.secondDistance(
+        distance,
+        math.acos(dir1.dot(dir2).clamp(-1.0, 1.0)),
+      );
+      // Endpoints may legitimately change adjacency at a bevel corner. The
+      // middle contacts must nevertheless lie on both original support faces.
+      if (BrepClassify.containsPlaneFace(
+                s,
+                s.faces[faces[0]],
+                frame.$1 + dir1 * distance,
+              ) ==
+              false ||
+          BrepClassify.containsPlaneFace(
+                s,
+                s.faces[faces[1]],
+                frame.$1 + dir2 * d2,
+              ) ==
+              false) {
+        throw BrepUnsupported('Chamfer distance exceeds the adjacent face');
+      }
+      final p = a + dir1 * distance, q = a + dir2 * d2;
+      var normal = tangent.cross(q - p);
+      final outward =
+          s.faces[faces[0]].outwardNormal(0, 0) +
+          s.faces[faces[1]].outwardNormal(0, 0);
+      if (normal.dot(outward) < 0) normal = -normal;
+      if (normal.length < 1e-12) {
+        throw BrepUnsupported('Chamfer planes are opposite');
+      }
+      cuts.add(BrepPlane(origin: p, normal: normal));
+    }
+    final result = BrepConvexPlanes.clip(s, cuts);
+    return result.solid;
   }
 
   static BrepSolid _blendPlaneCone(
@@ -3287,16 +3476,16 @@ class BrepFillet {
     double d,
     ChamferOptions options,
   ) {
-    final plane = planeFace.surface as BrepPlane;
     final cyl = cylFace.surface as BrepCylinder;
     final circle = s.edges[edgeId].curve as BrepCircle;
     final depth = options.secondDistance(d, math.pi / 2);
-    final major = cyl.radius + (cylFace.reversed ? d : -d);
-    if (major < 1e-6) {
+    final frame = chamferFrame(s, edgeId)!;
+    final radial = (frame.$1 - circle.center).normalized();
+    final major = cyl.radius + frame.$2.dot(radial).sign * d;
+    if (major < -1e-7) {
       throw BrepUnsupported('Chamfer too large for cylinder');
     }
-    final nCap = planeFace.reversed ? -plane.normal : plane.normal;
-    final into = -nCap;
+    final into = frame.$3;
     final cone = BrepCone(
       origin: circle.center + into * depth,
       axis: -into,
@@ -3311,38 +3500,19 @@ class BrepFillet {
       radius: major,
       xDir: circle.xDir,
     );
-    // Reuse torus rebuild but with cone instead of torus.
-    final dummyTorus = BrepTorus(
-      center: circle.center + into * depth,
-      axis: cyl.axis,
-      majorRadius: major,
-      minorRadius: depth,
-      xDir: cyl.xDir,
-    );
-    final rebuilt = _rebuildCylinderFilletCap(
+    return _rebuildCircularRim(
       s,
-      cyl,
-      plane,
-      circle,
+      edgeId,
+      s.faces.indexOf(planeFace),
+      s.faces.indexOf(cylFace),
       inner,
-      dummyTorus,
-      d,
+      BrepCircle(
+        center: circle.center + into * depth,
+        normal: circle.normal,
+        radius: cyl.radius,
+        xDir: circle.xDir,
+      ),
+      cone,
     );
-    // Replace torus face with cone.
-    final b = BrepBuilder();
-    for (var i = 0; i < rebuilt.vertices.length; i++) {
-      b.vertex(rebuilt.vertices[i]);
-    }
-    for (final e in rebuilt.edges) {
-      b.edge(e.v0, e.v1, e.curve);
-    }
-    for (final f in rebuilt.faces) {
-      if (identical(f.surface, dummyTorus)) {
-        b.face(cone, f.loops, reversed: cylFace.reversed);
-      } else {
-        b.face(f.surface, f.loops, reversed: f.reversed);
-      }
-    }
-    return b.build();
   }
 }

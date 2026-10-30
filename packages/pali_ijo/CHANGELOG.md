@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.3 — Unreleased
+
+ - Expanded Fillet and Chamfer support for circular rims, hollow bodies, inside corners, successive blends, and mitred shapes.
+- Improved Hollow for chamfered bodies and solids containing extruded text, splines, and elliptical curves.
+- Improved threading of multiple holes, rounded parts, partial threads, and custom sizes.
+- Fixed further modeling operations on supported scaled and mirrored geometry.
+- Improved extrusion and Boolean operations involving text, projected curves, touching outlines, and complex SVG profiles.
+- Improved STEP import, assembly placement, curve precision, and repair of malformed boundaries.
+- Expanded 3MF support for compressed packages, component instances, units, and mirrored geometry.
+- Improved tessellation of curved surfaces, threaded geometry, thin features, and faces containing complex holes.
+- Added native cuts through toroidal surfaces
+
 ## 0.1.2
 
 - Fixed incomplete arcs in extruded profiles that could cause unions against curved walls to fail.

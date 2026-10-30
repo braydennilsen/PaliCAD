@@ -4,6 +4,8 @@ import 'package:vector_math/vector_math_64.dart';
 
 import '../measure/bounds.dart';
 import 'boolean.dart';
+import 'contact.dart';
+import 'curve_equivalence.dart';
 import 'geom.dart';
 import 'heal.dart';
 import 'primitives.dart';
@@ -25,7 +27,57 @@ class BrepExtrude {
     Vector3 direction, {
     List<List<Vector3>> holes = const [],
     List<(Vector3, Vector3)> linearEdges = const [],
+    List<BrepSplineCurve> sourceSplines = const [],
   }) {
+    if (sourceSplines.isNotEmpty) {
+      final rings = [
+        prepareRing(ring, direction),
+        for (final h in holes) prepareRing(h, direction),
+      ];
+      final preserved = [
+        for (final r in rings)
+          _preserveSplines(r, sourceSplines, linearEdges, direction),
+      ];
+      if (preserved.any((c) => c != null)) {
+        final b = BrepBuilder(), loops = <BrepLoop>[];
+        final normal = _profileNormal(rings.first, direction);
+        for (var j = 0; j < rings.length; j++) {
+          final r = rings[j];
+          final cylinder = _hasLinearEdge(r, linearEdges)
+              ? null
+              : BrepPrimitives.tryCylinderFromRing(r, normal);
+          final circle = cylinder?.edges
+              .map((e) => e.curve)
+              .whereType<BrepCircle>()
+              .where((c) => (c.center - r.first).dot(normal).abs() < 1e-7)
+              .firstOrNull;
+          final curves =
+              preserved[j] ??
+              (circle == null ? null : <BrepCurve>[circle]) ??
+              fitCircularRuns(r, normal, linearEdges: linearEdges)?.curves ??
+              [
+                for (var i = 0; i < r.length; i++)
+                  BrepLine(r[i], r[(i + 1) % r.length]),
+              ];
+          final vertices = [for (final c in curves) b.vertex(c.evaluate(c.t0))];
+          loops.add(
+            BrepLoop([
+              for (var i = 0; i < curves.length; i++)
+                BrepCoedge(
+                  b.edge(
+                    vertices[i],
+                    vertices[(i + 1) % curves.length],
+                    curves[i],
+                  ),
+                ),
+            ]),
+          );
+        }
+        b.face(BrepPlane(origin: rings.first.first, normal: normal), loops);
+        final face = b.build();
+        return fromFace(face, face.faces.single, direction);
+      }
+    }
     if (holes.isNotEmpty) {
       return profileWithHoles(ring, holes, direction, linearEdges: linearEdges);
     }
@@ -34,6 +86,186 @@ class BrepExtrude {
       if (cylinder != null) return cylinder;
     }
     return profile(ring, direction, linearEdges: linearEdges);
+  }
+
+  /// Retain whole source cubic spans only when the arrangement follows their
+  /// samples in parameter order. Split/intersected regions retain the existing
+  /// sampled-boundary path; this never replaces a different selected boundary.
+  static List<BrepCurve>? _preserveSplines(
+    List<Vector3> ring,
+    List<BrepSplineCurve> sources,
+    List<(Vector3, Vector3)> linearEdges,
+    Vector3 direction,
+  ) {
+    if (ring.length < 4) return null;
+    const eps = 1e-6;
+    final matches = <int, (int, BrepCurve)>{};
+    final protectedEdges = [...linearEdges];
+    var unsafeCurve = false;
+    final normal = _profileNormal(ring, direction);
+    final x = normal
+        .cross(normal.x.abs() < .8 ? Vector3(1, 0, 0) : Vector3(0, 1, 0))
+        .normalized();
+    final y = normal.cross(x);
+    Vector2 project(Vector3 p) => Vector2(p.dot(x), p.dot(y));
+    final polygon = ring.map(project).toList();
+    bool crosses(Vector2 a, Vector2 b, Vector2 c, Vector2 d) {
+      if (math.max(a.x, b.x) < math.min(c.x, d.x) ||
+          math.max(c.x, d.x) < math.min(a.x, b.x) ||
+          math.max(a.y, b.y) < math.min(c.y, d.y) ||
+          math.max(c.y, d.y) < math.min(a.y, b.y))
+        return false;
+      final ab = b - a, cd = d - c, ac = c - a;
+      final den = ab.x * cd.y - ab.y * cd.x;
+      if (den.abs() < 1e-12) return false;
+      final t = (ac.x * cd.y - ac.y * cd.x) / den;
+      final u = (ac.x * ab.y - ac.y * ab.x) / den;
+      return t > 1e-8 && t < 1 - 1e-8 && u > 1e-8 && u < 1 - 1e-8;
+    }
+
+    bool preservesBoundary(BrepCurve c, int first, int count) {
+      // A span can pass through all its coarse samples yet loop across a
+      // neighbouring branch between them. Restoring it would change the
+      // selected arrangement region. Retain that run's native straight trims.
+      final samples = [
+        for (var k = 0; k <= 64; k++)
+          project(c.evaluate(c.t0 + (c.t1 - c.t0) * k / 64)),
+      ];
+      for (var k = 0; k < samples.length - 1; k++) {
+        final a = samples[k], b = samples[k + 1];
+        for (var j = k + 2; j < samples.length - 1; j++) {
+          if (crosses(a, b, samples[j], samples[j + 1])) return false;
+        }
+        for (var j = 0; j < ring.length; j++) {
+          if ((j - first + ring.length) % ring.length < count) continue;
+          if (crosses(a, b, polygon[j], polygon[(j + 1) % ring.length]))
+            return false;
+        }
+      }
+      return true;
+    }
+
+    for (var i = 0; i < ring.length; i++) {
+      for (final c in sources) {
+        for (final reverse in [false, true]) {
+          final start = reverse ? c.t1 : c.t0, end = reverse ? c.t0 : c.t1;
+          if ((c.evaluate(start) - ring[i]).length > eps) continue;
+          var previous = 0.0;
+          for (var count = 1; count <= ring.length; count++) {
+            final p = ring[(i + count) % ring.length];
+            if ((c.evaluate(end) - p).length <= eps) {
+              if (count >= 3) {
+                if (preservesBoundary(c, i, count)) {
+                  matches[i] = (count, c.trimmed(start, end));
+                } else {
+                  unsafeCurve = true;
+                  for (var j = 0; j < count; j++) {
+                    protectedEdges.add((
+                      ring[(i + j) % ring.length],
+                      ring[(i + j + 1) % ring.length],
+                    ));
+                  }
+                }
+              }
+              break;
+            }
+            final t = c.closestParam(p), u = (t - start) / (end - start);
+            if (u <= previous || u >= 1 || (c.evaluate(t) - p).length > eps) {
+              break;
+            }
+            previous = u;
+          }
+        }
+      }
+    }
+    if (matches.isEmpty)
+      return unsafeCurve
+          ? [
+              for (var i = 0; i < ring.length; i++)
+                BrepLine(ring[i], ring[(i + 1) % ring.length]),
+            ]
+          : null;
+    final start = matches.keys.first, result = <BrepCurve>[];
+    var used = 0;
+    while (used < ring.length) {
+      final index = (start + used) % ring.length, match = matches[index];
+      if (match != null) {
+        if (used + match.$1 > ring.length) return null;
+        result.add(match.$2);
+        used += match.$1;
+      } else {
+        final chain = <Vector3>[ring[index]];
+        do {
+          used++;
+          chain.add(ring[(start + used) % ring.length]);
+        } while (used < ring.length &&
+            !matches.containsKey((start + used) % ring.length));
+        // Reuse circular fitting for the rest of a mixed arc/spline outline.
+        final normal = _profileNormal(ring, direction);
+        final fitted = chain.length >= 6
+            ? fitCircularRuns(
+                chain,
+                normal,
+                linearEdges: [...protectedEdges, (chain.last, chain.first)],
+              )
+            : null;
+        if (fitted == null) {
+          result.addAll([
+            for (var i = 1; i < chain.length; i++)
+              BrepLine(chain[i - 1], chain[i]),
+          ]);
+        } else {
+          // The synthetic closing chord is not part of the selected boundary.
+          final kept = fitted.curves
+              .where(
+                (c) =>
+                    !((c.evaluate(c.t0) - chain.last).length <= eps &&
+                        (c.evaluate(c.t1) - chain.first).length <= eps),
+              )
+              .toList();
+          // Rotate the fitted open chain back to its original start.
+          final first = kept.indexWhere(
+            (c) => (c.evaluate(c.t0) - chain.first).length <= eps,
+          );
+          if (first < 0) return null;
+          result.addAll([...kept.skip(first), ...kept.take(first)]);
+        }
+      }
+    }
+    var cursor = start;
+    final safe = <BrepCurve>[];
+    for (final c in result) {
+      var count = 1;
+      while (count <= ring.length &&
+          (ring[(cursor + count) % ring.length] - c.evaluate(c.t1)).length >
+              eps) {
+        count++;
+      }
+      if (count > ring.length) return null;
+      if (c is BrepCircle && !preservesBoundary(c, cursor, count)) {
+        safe.addAll([
+          for (var j = 0; j < count; j++)
+            BrepLine(
+              ring[(cursor + j) % ring.length],
+              ring[(cursor + j + 1) % ring.length],
+            ),
+        ]);
+      } else {
+        safe.add(c);
+      }
+      cursor = (cursor + count) % ring.length;
+    }
+    result
+      ..clear()
+      ..addAll(safe);
+    for (var i = 0; i < result.length; i++) {
+      final next = result[(i + 1) % result.length];
+      if ((result[i].evaluate(result[i].t1) - next.evaluate(next.t0)).length >
+          eps) {
+        return null;
+      }
+    }
+    return result;
   }
 
   static bool _isLinearEdge(
@@ -255,7 +487,7 @@ class BrepExtrude {
         ]);
       }
     }
-    return BrepHeal.run(b.build());
+    return pairPlanarLineContacts(BrepHeal.run(b.build()));
   }
 
   /// Slide a planar cap along its outward normal when every vertex has a
@@ -265,18 +497,14 @@ class BrepExtrude {
     int faceIndex,
     double distance,
   ) {
+    solid = BrepXform.materializeForEditing(solid);
     final rails = _railsForPlanarFace(solid, faceIndex);
     if (rails == null) return null;
     if (distance.abs() < 1e-12) return solid;
     if (distance < 0 && -distance >= rails.minRail - 1e-6) {
       return BrepSolid(vertices: const [], edges: const [], faces: const []);
     }
-    return _shiftVertices(
-      solid,
-      rails.faceVerts,
-      rails.n * distance,
-      planeFaceIndex: faceIndex,
-    );
+    return _shiftVertices(solid, rails.faceVerts, rails.n * distance);
   }
 
   /// Inward union along a planar cap: no-op while the prism stays inside the
@@ -287,6 +515,7 @@ class BrepExtrude {
     double distance,
   ) {
     if (distance >= -1e-12) return null;
+    solid = BrepXform.materializeForEditing(solid);
     final rails = _railsForPlanarFace(solid, faceIndex);
     if (rails == null) return null;
     final depth = -distance;
@@ -332,7 +561,7 @@ class BrepExtrude {
         final o = e.v0 == vi ? e.v1 : e.v0;
         final dir = solid.vertices[o] - solid.vertices[vi];
         if (dir.length < 1e-12) continue;
-        if (dir.normalized().dot(n).abs() < 0.999) continue;
+        if (dir.normalized().cross(n).length > 1e-9) continue;
         other = o;
         break;
       }
@@ -352,6 +581,28 @@ class BrepExtrude {
     for (final f in solid.faces) {
       if (f.loops.isEmpty || f.loops.any((loop) => loop.coedges.isEmpty)) {
         return null;
+      }
+      final surface = f.surface;
+      if (surface is BrepPlane) {
+        final dot = surface.normal.dot(n).abs();
+        if (dot > 1e-9 && (dot - 1).abs() > 1e-9) return null;
+      } else if (surface is BrepCylinder) {
+        if (surface.axis.cross(n).length > 1e-9) return null;
+      } else {
+        final ruled = surface is BrepRuledSurface
+            ? surface
+            : surface is BrepSplineSurface
+            ? surface.ruled
+            : null;
+        if (ruled == null) return null;
+        final shift =
+            ruled.upper.evaluate(ruled.upper.t0) -
+            ruled.lower.evaluate(ruled.lower.t0);
+        if (shift.length < 1e-9 ||
+            shift.normalized().cross(n).length > 1e-9 ||
+            !sameRationalCurve(ruled.lower, ruled.upper, translation: shift)) {
+          return null;
+        }
       }
     }
 
@@ -376,85 +627,22 @@ class BrepExtrude {
   static BrepSolid _shiftVertices(
     BrepSolid solid,
     Set<int> movedVerts,
-    Vector3 delta, {
-    int? planeFaceIndex,
-  }) {
-    final verts = [
-      for (var i = 0; i < solid.vertices.length; i++)
-        movedVerts.contains(i)
-            ? solid.vertices[i] + delta
-            : solid.vertices[i].clone(),
-    ];
-    final edges = <BrepEdge>[
-      for (var i = 0; i < solid.edges.length; i++)
-        BrepEdge(
-          v0: solid.edges[i].v0,
-          v1: solid.edges[i].v1,
-          // A vertex shift preserves topology, so provenance carries by index.
-          // That matters here more than anywhere: the whole point of a face
-          // move is that it is still the same face, even though it now sits on
-          // a different plane and so would not match geometrically.
-          origin: solid.edges[i].origin,
-          curve: _movedEdgeCurve(
-            solid.edges[i],
-            verts[solid.edges[i].v0],
-            verts[solid.edges[i].v1],
-            delta,
-            movedVerts.contains(solid.edges[i].v0) &&
-                movedVerts.contains(solid.edges[i].v1),
-          ),
-        ),
-    ];
-    bool faceFullyMoved(BrepFace f) {
-      for (final loop in f.loops) {
-        for (final c in loop.coedges) {
-          final e = solid.edges[c.edge];
-          if (!movedVerts.contains(e.v0) || !movedVerts.contains(e.v1)) {
-            return false;
-          }
-        }
-      }
-      return f.loops.isNotEmpty;
-    }
-
-    final faces = <BrepFace>[
-      for (var i = 0; i < solid.faces.length; i++)
-        i == planeFaceIndex ||
-                (solid.faces[i].surface is BrepPlane &&
-                    faceFullyMoved(solid.faces[i]))
-            ? BrepFace(
-                surface: (solid.faces[i].surface as BrepPlane).offset(
-                  (solid.faces[i].surface as BrepPlane).normal.dot(delta),
-                ),
-                loops: solid.faces[i].loops,
-                reversed: solid.faces[i].reversed,
-                origin: solid.faces[i].origin,
-              )
-            : solid.faces[i],
-    ];
-    return BrepHeal.run(BrepSolid(vertices: verts, edges: edges, faces: faces));
-  }
-
-  static BrepCurve _movedEdgeCurve(
-    BrepEdge edge,
-    Vector3 a,
-    Vector3 b,
     Vector3 delta,
-    bool bothMoved,
   ) {
-    final curve = edge.curve;
-    if (curve is BrepLine) return BrepLine(a, b);
-    if (curve is BrepCircle) {
-      return BrepCircle(
-        center: bothMoved ? curve.center + delta : curve.center.clone(),
-        normal: curve.normal,
-        radius: curve.radius,
-        xDir: curve.xDir,
-        t0: curve.t0,
-        t1: curve.t1,
-      );
-    }
-    return curve;
+    // The rail check establishes two parallel caps of a complete prism.
+    // Stretch the entire BREP between them: moving only endpoint vertices
+    // leaves spline trim curves and their ruled wall surfaces at the old cap.
+    final normal = delta.normalized();
+    final fixed =
+        solid.vertices[List.generate(
+          solid.vertices.length,
+          (i) => i,
+        ).firstWhere((i) => !movedVerts.contains(i))];
+    final span = (solid.vertices[movedVerts.first] - fixed).dot(normal);
+    final transform = BrepAffineTransform.fromFunction(
+      (p) => p + delta * ((p - fixed).dot(normal) / span),
+    );
+    return BrepXform.materializeForEditing(BrepXform.affine(solid, transform));
   }
 
   /// Glue a prism onto [faceIndex] along [direction], dropping the original
@@ -728,7 +916,7 @@ class BrepExtrude {
           BrepCoedge(e1[i], reversed: true),
           BrepCoedge(rails[i], reversed: true),
         ]);
-        if (ruled) {
+        if (ruled && curve is! BrepLine) {
           b.face(BrepRuledSurface(curve, topCurve), [loop]);
         } else if (curve is BrepCircle) {
           final mid = (curve.t0 + curve.t1) / 2;
@@ -776,7 +964,7 @@ class BrepExtrude {
       ),
       upper,
     );
-    return BrepHeal.sewClosedRims(b.build());
+    return pairPlanarLineContacts(BrepHeal.sewClosedRims(b.build()));
   }
 
   /// Sweep mixed line/arc loops. Concave arcs (a D-notch) reverse the
@@ -1017,6 +1205,24 @@ class BrepExtrude {
     Vector3 end,
     Vector3 shift,
   ) {
+    if (curve is BrepAffineCurve) {
+      // Orient in the source curve's coordinates, then apply the exact map.
+      // start/end already include the extrusion's origin shift; remove it
+      // before mapping back so nested translations are not applied twice.
+      final oriented = _curveAlong(
+        curve.base,
+        reversed,
+        curve.transform.inversePoint(start - shift),
+        curve.transform.inversePoint(end - shift),
+        Vector3.zero(),
+      );
+      if (oriented is BrepLine) return BrepLine(start, end);
+      final m = curve.transform;
+      return BrepAffineCurve(
+        oriented,
+        BrepAffineTransform(m.x, m.y, m.z, m.offset + shift),
+      );
+    }
     BrepCurve? oriented;
     if (curve is BrepSurfaceIntersectionCurve)
       oriented = curve.trimmed(

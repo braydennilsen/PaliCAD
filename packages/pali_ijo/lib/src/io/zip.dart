@@ -1,37 +1,49 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
-/// A minimal ZIP reader and writer, because 3MF is a ZIP archive.
-///
-/// Entries are **stored**, not deflated. That is a legal ZIP — method 0 is in
-/// the specification and every reader supports it — and it is what lets this
-/// package stay on `vector_math` and `args` alone rather than pulling in a
-/// compression library for one file format. A 3MF of a CAD model is XML that
-/// would compress well, so the cost is real file size; the benefit is that a
-/// consumer of this kernel inherits no dependency they did not ask for.
-///
-/// The reader accepts deflated entries' presence but cannot decode them, and
-/// says so rather than returning wrong bytes.
+import 'package:archive/archive.dart' as zip;
+
+/// ZIP container used by 3MF. Stored output remains deterministic; input accepts
+/// ordinary DEFLATE, data descriptors and ZIP64 through the portable decoder.
+/// Entries are inflated and CRC-checked only when requested, so slicer G-code,
+/// thumbnails and unrelated metadata do not consume uncompressed memory.
 class ZipArchive {
   ZipArchive();
 
   final Map<String, Uint8List> _entries = {};
+  final Map<String, zip.ArchiveFile> _encoded = {};
 
-  Iterable<String> get names => _entries.keys;
+  Iterable<String> get names => {..._encoded.keys, ..._entries.keys};
 
-  int get length => _entries.length;
+  int get length => names.length;
 
-  Uint8List? operator [](String name) => _entries[name];
+  Uint8List? operator [](String name) {
+    final cached = _entries[name];
+    if (cached != null) return cached;
+    final entry = _encoded[name];
+    if (entry == null) return null;
+    try {
+      final content = entry.content as List<int>;
+      if (content.length != entry.size ||
+          zip.getCrc32(content) != entry.crc32) {
+        throw const FormatException('Size or CRC checksum mismatch');
+      }
+      return _entries[name] = content is Uint8List
+          ? content
+          : Uint8List.fromList(content);
+    } catch (error) {
+      throw FormatException('Invalid ZIP entry "$name": $error');
+    }
+  }
 
   void addBytes(String name, List<int> bytes) {
     _entries[name] = Uint8List.fromList(bytes);
   }
 
-  void addText(String name, String text) =>
-      addBytes(name, utf8.encode(text));
+  void addText(String name, String text) => addBytes(name, utf8.encode(text));
 
   String? readText(String name) {
-    final bytes = _entries[name];
+    final bytes = this[name];
     return bytes == null ? null : utf8.decode(bytes);
   }
 
@@ -41,9 +53,9 @@ class ZipArchive {
     final directory = BytesBuilder();
     var count = 0;
 
-    for (final entry in _entries.entries) {
-      final name = utf8.encode(entry.key);
-      final data = entry.value;
+    for (final key in names) {
+      final name = utf8.encode(key);
+      final data = this[key]!;
       final crc = _crc32(data);
       final offset = out.length;
 
@@ -108,47 +120,42 @@ class ZipArchive {
   /// headers, so an entry's own name and size come from the authoritative
   /// record.
   static ZipArchive fromBytes(Uint8List bytes) {
-    final data = ByteData.sublistView(bytes);
-    final eocd = _findEndOfCentralDirectory(bytes);
-    if (eocd < 0) {
-      throw FormatException('Not a ZIP archive: no end-of-directory record');
-    }
-
-    final count = data.getUint16(eocd + 10, Endian.little);
-    var p = data.getUint32(eocd + 16, Endian.little);
-    final archive = ZipArchive();
-
-    for (var i = 0; i < count; i++) {
-      if (p + 46 > bytes.length ||
-          data.getUint32(p, Endian.little) != 0x02014b50) {
-        throw FormatException('ZIP directory entry $i is malformed');
-      }
-      final method = data.getUint16(p + 10, Endian.little);
-      final size = data.getUint32(p + 24, Endian.little);
-      final nameLen = data.getUint16(p + 28, Endian.little);
-      final extraLen = data.getUint16(p + 30, Endian.little);
-      final commentLen = data.getUint16(p + 32, Endian.little);
-      final offset = data.getUint32(p + 42, Endian.little);
-      final name = utf8.decode(
-        bytes.sublist(p + 46, p + 46 + nameLen),
-        allowMalformed: true,
+    if (_findEndOfCentralDirectory(bytes) < 0) {
+      throw const FormatException(
+        'Not a ZIP archive: no end-of-directory record',
       );
-
-      if (method != 0) {
-        throw UnsupportedError(
-          'ZIP entry "$name" is compressed (method $method). This reader '
-          'handles stored entries only; see ZipArchive.',
-        );
-      }
-
-      final localNameLen = data.getUint16(offset + 26, Endian.little);
-      final localExtraLen = data.getUint16(offset + 28, Endian.little);
-      final start = offset + 30 + localNameLen + localExtraLen;
-      archive.addBytes(name, bytes.sublist(start, start + size));
-
-      p += 46 + nameLen + extraLen + commentLen;
     }
-    return archive;
+    try {
+      final decoder = zip.ZipDecoder();
+      final decoded = decoder.decodeBytes(bytes);
+      final headers = decoder.directory.fileHeaders;
+      if (headers.length != decoder.directory.totalCentralDirectoryEntries ||
+          decoder.directory.numberOfThisDisk != 0 ||
+          decoder.directory.diskWithTheStartOfTheCentralDirectory != 0) {
+        throw const FormatException('Incomplete or split ZIP directory');
+      }
+      // The central directory is authoritative, including for 64-bit data
+      // descriptors. Older decoder versions read those trailing sizes as
+      // 32-bit values, so do not use their local-header size for validation.
+      final metadata = {for (final h in headers) h.filename: h};
+      if (metadata.length != headers.length) {
+        throw const FormatException('Duplicate ZIP entry');
+      }
+      final archive = ZipArchive();
+      for (final file in decoded.files) {
+        if (!file.isFile) continue;
+        final header = metadata[file.name]!;
+        file.size = header.uncompressedSize!;
+        file.crc32 = header.crc32;
+        if (archive._encoded.containsKey(file.name)) {
+          throw FormatException('Duplicate ZIP entry "${file.name}"');
+        }
+        archive._encoded[file.name] = file;
+      }
+      return archive;
+    } catch (error) {
+      throw FormatException('Invalid ZIP archive: $error');
+    }
   }
 
   /// The end-of-central-directory record sits at the end, but a trailing

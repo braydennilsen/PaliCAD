@@ -286,6 +286,32 @@ class BrepBoolean {
             relative.x.dot(relative.y).abs() < 1e-10 * scale * scale &&
             relative.x.dot(relative.z).abs() < 1e-10 * scale * scale &&
             relative.y.dot(relative.z).abs() < 1e-10 * scale * scale;
+        bool rationalRail(BrepCurve c) =>
+            c is BrepLine ||
+            c is BrepCircle ||
+            c is BrepEllipse ||
+            c is BrepSplineCurve ||
+            c is BrepAffineCurve && rationalRail(c.base);
+        if (orthogonal &&
+            lengths.every((v) => (v - 1).abs() < 1e-10) &&
+            relative.determinant > 0 &&
+            source.faces.every(
+              (f) =>
+                  f.surface is BrepPlane ||
+                  f.surface is BrepCylinder ||
+                  f.surface is BrepCone ||
+                  f.surface is BrepSphere ||
+                  f.surface is BrepTorus ||
+                  f.surface is BrepSplineSurface ||
+                  f.surface is BrepRuledSurface &&
+                      rationalRail((f.surface as BrepRuledSurface).lower) &&
+                      rationalRail((f.surface as BrepRuledSurface).upper),
+            )) {
+          // Rotation/translation preserves rational and ruled surfaces exactly.
+          // Materialize the placement so differing body frames do not recurse
+          // through generic affine wrappers or reject ordinary sketch sweeps.
+          return BrepXform.rigid(source, relative);
+        }
         if (!orthogonal ||
             !lengths.every((v) => (v - scale).abs() < 1e-10 * scale) ||
             !source.faces.every(
@@ -364,6 +390,15 @@ class BrepBoolean {
           tb.transform,
         );
       }
+      // Differently scaled translational walls can still be represented
+      // exactly as ruled curves. Keep the cheap common-frame paths above,
+      // then expose supported world geometry for the general BREP trimmer.
+      final worldA = BrepXform.materializeForEditing(a);
+      final worldB = BrepXform.materializeForEditing(b);
+      if (worldA.faces.every((f) => f.surface is! BrepAffineSurface) &&
+          worldB.faces.every((f) => f.surface is! BrepAffineSurface)) {
+        return _run(worldA, worldB, op);
+      }
       throw BrepUnsupported(
         'Boolean between different affine curved surfaces needs a general surface trimmer',
       );
@@ -403,7 +438,8 @@ class BrepBoolean {
         }
         return result;
       }
-      if (_needsSphereBoundary(a, b) ||
+      if (_needsTorusBoundary(a, b) ||
+          _needsSphereBoundary(a, b) ||
           [...a.faces, ...b.faces].any(
             (f) =>
                 f.surface is BrepRuledSurface || f.surface is BrepSplineSurface,
@@ -1798,6 +1834,25 @@ class BrepBoolean {
       out.addAll(group);
     }
     return out;
+  }
+
+  static bool _needsTorusBoundary(BrepSolid a, BrepSolid b) {
+    for (final pair in [(a, b), (b, a)]) {
+      for (final face in pair.$1.faces) {
+        final tor = face.surface;
+        if (tor is! BrepTorus) continue;
+        for (final other in pair.$2.faces) {
+          final plane = other.surface;
+          if (plane is! BrepPlane) continue;
+          final dot = plane.normal.dot(tor.axis).abs();
+          if (dot > 0.999 ||
+              dot < 1e-3 && plane.height(tor.center).abs() <= 1e-6)
+            continue;
+          if (_planeHitsTorus(plane, tor)) return true;
+        }
+      }
+    }
+    return false;
   }
 
   static void _collectTorus(

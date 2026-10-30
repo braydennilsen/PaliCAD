@@ -251,7 +251,7 @@ class BrepSphere implements BrepSurface {
     if (outN.length < 1e-12) outN = Vector3(0, 0, 1);
     outN = Vector3.copy(outN).normalized();
     if (faceReversed) outN = -outN;
-    var inward = tang.cross(outN);
+    var inward = outN.cross(tang);
     if (inward.length < 1e-12) return small;
     final interior = closestPoint(p0 + inward.normalized() * radius * 0.25);
     return (interior - small).length <= (interior - large).length
@@ -622,7 +622,15 @@ class BrepEllipse implements BrepCurve {
   @override
   double closestParam(Vector3 p) {
     final d = p - center;
-    return math.atan2(d.dot(yDir) / rMinor, d.dot(xDir.normalized()) / rMajor);
+    final angle = math.atan2(
+      d.dot(yDir) / rMinor,
+      d.dot(xDir.normalized()) / (rMajor * xDir.length),
+    );
+    final lo = math.min(t0, t1), hi = math.max(t0, t1);
+    final middle = (lo + hi) / 2;
+    final t = angle + ((middle - angle) / (2 * math.pi)).round() * 2 * math.pi;
+    if (t >= lo && t <= hi) return t;
+    return (evaluate(lo) - p).length2 <= (evaluate(hi) - p).length2 ? lo : hi;
   }
 
   @override

@@ -1,9 +1,0 @@
-# Dart tooling.
-.dart_tool/
-
-# Output of tool/build_cli.sh and tool/build_wasm.sh.
-build/
-
-# pubspec.lock is committed: this package ships an executable, and a locked
-# resolution is what makes a build reproducible. It is also the evidence that
-# the package resolves with no Flutter in the graph.

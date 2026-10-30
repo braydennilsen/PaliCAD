@@ -2,7 +2,7 @@ name: pali_ijo
 description: >-
   Pure-Dart BREP CAD kernel with native solid modelling, mesh operations,
   measurement and CAD interchange.
-version: 0.1.2
+version: 0.1.3
 repository: https://github.com/braydennilsen/PaliCAD/tree/main/packages/pali_ijo
 
 # Consumed by PaliCAD as a path dependency today, and as a git dependency once
@@ -15,8 +15,10 @@ environment:
 # Deliberately Flutter-free: `test/no_flutter_test.dart` enforces that nothing
 # under lib/ or bin/ reaches for Flutter or the PaliCAD app package.
 dependencies:
+  archive: ^3.6.1
   args: ^2.6.0
   vector_math: ^2.1.4
+  xml: ^6.6.1
 
 dev_dependencies:
   lints: ^5.0.0

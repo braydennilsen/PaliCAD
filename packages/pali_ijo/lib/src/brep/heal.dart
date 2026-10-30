@@ -427,8 +427,17 @@ class BrepHeal {
   }
 
   /// Join adjacent coplanar faces that share an edge into one loop.
-  static BrepSolid mergeCoplanar(BrepSolid s) {
-    if (s.faces.length < 2) return s;
+  /// Join adjacent planar patches, optionally restricting joins to one source
+  /// face. [faceMap] receives every old-to-new face index; vertices and edges
+  /// retain their indices so display tags can be updated without retessellation.
+  static BrepSolid mergeCoplanar(
+    BrepSolid s, {
+    Map<int, int>? faceMap,
+    bool sameOriginOnly = false,
+  }) {
+    var groups = [
+      for (var i = 0; i < s.faces.length; i++) [i],
+    ];
     var faces = [for (final f in s.faces) f];
     var changed = true;
     while (changed) {
@@ -440,6 +449,9 @@ class BrepHeal {
         for (var j = i + 1; j < faces.length; j++) {
           final b = faces[j];
           if (b.surface is! BrepPlane || b.loops.length != 1) continue;
+          if (sameOriginOnly && (a.origin == null || a.origin != b.origin)) {
+            continue;
+          }
           final pa = a.surface as BrepPlane;
           final pb = b.surface as BrepPlane;
           // A reversed +Z plane and a forward -Z plane face the same way.
@@ -474,10 +486,27 @@ class BrepHeal {
           faces = [
             for (var k = 0; k < faces.length; k++)
               if (k != i && k != j) faces[k],
-            BrepFace(surface: pa, loops: [merged], reversed: a.reversed),
+            BrepFace(
+              surface: pa,
+              loops: [merged],
+              reversed: a.reversed,
+              origin: a.origin,
+            ),
+          ];
+          groups = [
+            for (var k = 0; k < groups.length; k++)
+              if (k != i && k != j) groups[k],
+            [...groups[i], ...groups[j]],
           ];
           changed = true;
           break outer;
+        }
+      }
+    }
+    if (faceMap != null) {
+      for (var i = 0; i < groups.length; i++) {
+        for (final old in groups[i]) {
+          faceMap[old] = i;
         }
       }
     }
@@ -1121,8 +1150,9 @@ class BrepHeal {
 
   /// A position-welded display can have four triangles on a contact line,
   /// even though the BREP has two distinct, closed edges there. Accept only
-  /// exact planar line contacts whose oriented triangle pairs match those
-  /// BREP edges. This does not relax the checks for gaps or missing faces.
+  /// exact straight contacts between planar or ruled generator walls whose
+  /// oriented triangle pairs match those BREP edges. Gaps and missing faces
+  /// remain invalid.
   static bool _closedPlanarContacts(BrepSolid s, MeshData mesh) {
     if (!hasPairedPlanarContacts(s)) return false;
     final faceIds = mesh.faceIds;

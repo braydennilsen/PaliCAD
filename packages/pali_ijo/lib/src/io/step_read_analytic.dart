@@ -14,7 +14,11 @@ import '../ijo_log.dart';
 import '../brep/solid.dart';
 import '../brep/heal.dart';
 import '../brep/spline_convert.dart';
+import '../brep/xform.dart';
 import 'step_syntax.dart';
+
+part 'step_read_assembly.dart';
+part 'step_read_repair.dart';
 
 /// Raised when a STEP file is valid but describes geometry this kernel has no
 /// representation for.
@@ -73,9 +77,16 @@ class StepBrepReadResult {
 
 /// Reads solids out of a STEP file.
 class StepReader {
-  StepReader._(this._file, this._scale, this._unitName, this._allowOpenShells);
+  StepReader._(
+    this._file,
+    this._scale,
+    this._unitName,
+    this._allowOpenShells,
+    this._repairDegenerateFaces,
+  );
 
   final bool _allowOpenShells;
+  final bool _repairDegenerateFaces;
 
   final StepFile _file;
   final double _scale;
@@ -83,6 +94,21 @@ class StepReader {
 
   final _notes = <String>[];
   final _unsupported = <String, int>{};
+  late final double _lengthTolerance = _readLengthTolerance();
+
+  double _readLengthTolerance() {
+    var tolerance = 1e-5;
+    for (final id in _file.idsOf('UNCERTAINTY_MEASURE_WITH_UNIT')) {
+      final measure = _file.typed(id, 'UNCERTAINTY_MEASURE_WITH_UNIT')!;
+      final unit = measure.arg(1);
+      final factor = unit is StepRef ? _lengthOf(_file, unit.id)?.$1 : null;
+      final value = _number(measure.arg(0));
+      if (factor != null && value != null && value.isFinite && value > 0) {
+        tolerance = math.max(tolerance, value * factor);
+      }
+    }
+    return tolerance;
+  }
 
   /// Our vertex index for each STEP vertex instance, and for each welded
   /// position when a face gives points rather than vertices.
@@ -100,10 +126,18 @@ class StepReader {
   static StepBrepReadResult read(
     Uint8List bytes, {
     bool allowOpenShells = false,
+    bool repairDegenerateFaces = false,
+    void Function(int completed, int total)? onProgress,
   }) {
     final file = StepFile.parse(_decode(bytes));
     final (scale, unitName) = _lengthUnit(file);
-    return StepReader._(file, scale, unitName, allowOpenShells)._run();
+    return StepReader._(
+      file,
+      scale,
+      unitName,
+      allowOpenShells,
+      repairDegenerateFaces,
+    )._run(onProgress);
   }
 
   /// STEP is Latin-1 by the standard, and files in the wild are usually ASCII
@@ -117,11 +151,12 @@ class StepReader {
     }
   }
 
-  StepBrepReadResult _run() {
+  StepBrepReadResult _run(void Function(int, int)? onProgress) {
     final bodies = [
       ..._file.idsOf('MANIFOLD_SOLID_BREP'),
       ..._file.idsOf('FACETED_BREP'),
       ..._file.idsOf('BREP_WITH_VOIDS'),
+      if (_allowOpenShells) ..._file.idsOf('SHELL_BASED_SURFACE_MODEL'),
     ].toSet().toList()..sort();
 
     if (bodies.isEmpty) {
@@ -145,16 +180,19 @@ class StepReader {
 
     final solids = <BrepSolid>[];
     final names = <String>[];
+    onProgress?.call(0, bodies.length);
     for (final id in bodies) {
       final record = _file.anyOf(id, [
         'MANIFOLD_SOLID_BREP',
         'FACETED_BREP',
         'BREP_WITH_VOIDS',
+        if (_allowOpenShells) 'SHELL_BASED_SURFACE_MODEL',
       ])!;
       final solid = _solid(id, record);
       solids.add(solid);
       final name = record.arg(0);
       names.add(name is StepText ? name.value : '');
+      onProgress?.call(solids.length, bodies.length);
     }
 
     if (solids.isEmpty) {
@@ -172,9 +210,10 @@ class StepReader {
       );
     }
 
+    final placed = _placeAssembly(bodies, solids, names);
     return StepBrepReadResult(
-      solids: solids,
-      names: names,
+      solids: placed.$1,
+      names: placed.$2,
       unitName: _unitName,
       unitScale: _scale,
       notes: List.unmodifiable(_notes),
@@ -194,12 +233,19 @@ class StepReader {
     // inner shells would fill the cavity in.
     final shells = <(int, bool)>[];
     final outer = record.arg(1);
-    if (outer is! StepRef) {
+    if (record.type == 'SHELL_BASED_SURFACE_MODEL' && outer is StepList) {
+      for (final shell in outer.items) {
+        if (shell is! StepRef)
+          throw const FormatException('Invalid STEP surface shell');
+        shells.add((shell.id, false));
+      }
+    } else if (outer is! StepRef) {
       throw StepBrepUnsupportedException(
         'Body #$id has no readable outer shell.',
       );
+    } else {
+      shells.add((outer.id, false));
     }
-    shells.add((outer.id, false));
     if (record.type == 'BREP_WITH_VOIDS') {
       final voids = record.arg(2);
       if (voids is! StepList || voids.items.isEmpty) {
@@ -266,7 +312,8 @@ class StepReader {
       );
     }
 
-    final solid = _compact(faces);
+    var solid = _compact(faces);
+    if (_repairDegenerateFaces) solid = _repairCollapsedCylinders(solid, id);
     if (!BrepHeal.topologyIsClosed(solid)) {
       if (!_allowOpenShells) {
         throw StepBrepUnsupportedException(
@@ -734,6 +781,29 @@ class StepReader {
     ];
   }
 
+  BrepCurve? _untrimmedConic(int id) {
+    final conic = _file.anyOf(id, ['CIRCLE', 'ELLIPSE']);
+    if (conic == null) return null;
+    final at = _placement(conic.arg(1)), major = _number(conic.arg(2));
+    if (at == null || major == null) return null;
+    if (conic.type == 'CIRCLE')
+      return BrepCircle(
+        center: at.origin,
+        normal: at.axis,
+        xDir: at.refDir,
+        radius: major * _scale,
+      );
+    final minor = _number(conic.arg(3));
+    if (minor == null) return null;
+    return BrepEllipse(
+      center: at.origin,
+      normal: at.axis,
+      xDir: at.refDir,
+      rMajor: major * _scale,
+      rMinor: minor * _scale,
+    );
+  }
+
   BrepSplineSurface? _splineSurface(int id) {
     final knots = _file.typed(id, 'B_SPLINE_SURFACE_WITH_KNOTS');
     if (knots == null) return null;
@@ -786,9 +856,10 @@ class StepReader {
         b -= period;
       }
     }
-    if ((c.evaluate(a) - p0).length > 1e-5 ||
-        (c.evaluate(b) - p1).length > 1e-5)
-      throw const FormatException('Spline edge endpoints are off its curve');
+    if ((c.evaluate(a) - p0).length > _lengthTolerance ||
+        (c.evaluate(b) - p1).length > _lengthTolerance) {
+      throw FormatException('Spline edge #$id endpoints are off its curve');
+    }
     return c.trimmed(a, b);
   }
 
@@ -864,19 +935,8 @@ class StepReader {
       final axis = _dir(placement?.arg(2));
       if (basis is! StepRef || origin == null || axis == null) return null;
       BrepSplineCurve? curve = _untrimmedSplineCurve(basis.id);
-      final circle = _file.typed(basis.id, 'CIRCLE');
-      if (circle != null) {
-        final at = _placement(circle.arg(1)), radius = _number(circle.arg(2));
-        if (at != null && radius != null)
-          curve = BrepSplineConvert.curve(
-            BrepCircle(
-              center: at.origin,
-              normal: at.axis,
-              xDir: at.refDir,
-              radius: radius * _scale,
-            ),
-          );
-      }
+      final conic = _untrimmedConic(basis.id);
+      if (conic != null) curve = BrepSplineConvert.curve(conic);
       if (curve == null) {
         _count(_file.typeName(basis.id));
         return null;
@@ -918,17 +978,9 @@ class StepReader {
       if (basis is! StepRef || direction == null || boundary.isEmpty)
         return null;
       BrepCurve? curve = _untrimmedSplineCurve(basis.id);
-      final circle = _file.typed(basis.id, 'CIRCLE');
-      if (circle != null) {
-        final at = _placement(circle.arg(1)), r = _number(circle.arg(2));
-        if (at != null && r != null)
-          curve = BrepCircle(
-            center: at.origin,
-            normal: at.axis,
-            xDir: at.refDir,
-            radius: r * _scale,
-          );
-      }
+      final conic = _untrimmedConic(basis.id);
+      if (conic != null)
+        curve = conic is BrepEllipse ? BrepSplineConvert.curve(conic) : conic;
       if (curve == null) {
         _count(_file.typeName(basis.id));
         return null;
@@ -1296,8 +1348,8 @@ class StepReader {
       Vector3 point(double t) =>
           at.origin + x * (a * cosh(t)) + y * (b * sinh(t));
       final start = parameter(p0), end = parameter(p1);
-      if ((point(start) - p0).length > 1e-5 ||
-          (point(end) - p1).length > 1e-5) {
+      if ((point(start) - p0).length > _lengthTolerance ||
+          (point(end) - p1).length > _lengthTolerance) {
         throw const FormatException(
           'Hyperbola edge endpoints are off its curve',
         );

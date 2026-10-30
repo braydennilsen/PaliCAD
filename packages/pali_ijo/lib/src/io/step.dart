@@ -235,10 +235,22 @@ class IjoStep {
   /// By default, incomplete shells are rejected. [allowOpenShells] retains
   /// readable open bodies for inspection and reports them in the result notes;
   /// unsupported or missing faces are still rejected.
+  /// [repairDegenerateFaces] opts into capping isolated openings of collapsed
+  /// cylindrical faces and sewing their retraced wires. This changes geometry;
+  /// callers must present the returned repair notes to the user.
+  /// [onProgress] counts source bodies after syntax parsing; assembly instances
+  /// are placed afterwards. It is not a time estimate for the whole import.
   static StepBrepReadResult readSolids(
     Uint8List bytes, {
     bool allowOpenShells = false,
-  }) => IjoStepBrep.readAll(bytes, allowOpenShells: allowOpenShells);
+    bool repairDegenerateFaces = false,
+    void Function(int completed, int total)? onProgress,
+  }) => IjoStepBrep.readAll(
+    bytes,
+    allowOpenShells: allowOpenShells,
+    repairDegenerateFaces: repairDegenerateFaces,
+    onProgress: onProgress,
+  );
 
   static MeshData read(Uint8List bytes) {
     try {

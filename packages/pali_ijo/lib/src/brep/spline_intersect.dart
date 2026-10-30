@@ -15,6 +15,7 @@ class BrepSplineIntersect {
   ) {
     BrepSplineSurface? rational(BrepSurface s) {
       if (s is BrepSplineSurface) return s;
+      if (s is BrepTorus) return BrepSplineConvert.surface(s);
       if (s is BrepRuledSurface) {
         final exact = BrepSplineConvert.exactRuled(s);
         if (exact != null) return exact;
@@ -83,6 +84,104 @@ class BrepSplineIntersect {
         'Surface pair has no bounded intersection representation',
       );
     return surfaces(x, y);
+  }
+
+  /// Certifies that a positive-weight spline patch stays on one side of a
+  /// quadric, allowing boundary-only contact within the topology tolerance.
+  /// Bernstein coefficients bound the whole patch, not just sampled points.
+  static bool boundaryContactOnly(
+    BrepSurface a,
+    BrepSurface b, {
+    double tolerance = 1e-6,
+  }) {
+    final patch = a is BrepSplineSurface
+        ? a
+        : b is BrepSplineSurface
+        ? b
+        : null;
+    final quadric = identical(patch, a) ? b : a;
+    if (patch == null || (quadric is! BrepCylinder && quadric is! BrepSphere)) {
+      return false;
+    }
+    final radius = quadric is BrepCylinder
+        ? quadric.radius
+        : (quadric as BrepSphere).radius;
+    // For spheres/cylinders, |F| <= 2*r*eps - eps² is strictly inside
+    // the geometric distance tolerance on either side of the surface.
+    if (radius <= tolerance) return false;
+    final implicitTolerance = 2 * radius * tolerance - tolerance * tolerance;
+    double choose(int n, int k) {
+      var out = 1.0;
+      for (var i = 1; i <= k; i++) {
+        out *= (n - i + 1) / i;
+      }
+      return out;
+    }
+
+    (double, double, double) range(_SplineCell cell) {
+      final u = cell.control.length - 1, v = cell.control.first.length - 1;
+      final coefficients = List.generate(
+        2 * u + 1,
+        (_) => List.filled(2 * v + 1, 0.0),
+      );
+      final points = [
+        for (final row in cell.control)
+          [for (final h in row) Vector3(h.x, h.y, h.z) / h.w],
+      ];
+      var minWeight = double.infinity;
+      for (var i = 0; i <= u; i++) {
+        for (var j = 0; j <= v; j++) {
+          final p = points[i][j], w = cell.control[i][j].w;
+          minWeight = math.min(minWeight, w);
+          for (var k = 0; k <= u; k++) {
+            for (var l = 0; l <= v; l++) {
+              final q = points[k][l];
+              final bilinear =
+                  (BrepQuadric.value(quadric, p) +
+                      BrepQuadric.value(quadric, q) -
+                      BrepQuadric.line(quadric, p, q - p).$1) *
+                  .5;
+              coefficients[i + k][j + l] +=
+                  bilinear *
+                  w *
+                  cell.control[k][l].w *
+                  choose(u, i) *
+                  choose(u, k) /
+                  choose(2 * u, i + k) *
+                  choose(v, j) *
+                  choose(v, l) /
+                  choose(2 * v, j + l);
+            }
+          }
+        }
+      }
+      final values = coefficients.expand((r) => r);
+      return (
+        values.reduce(math.min),
+        values.reduce(math.max),
+        implicitTolerance * minWeight * minWeight,
+      );
+    }
+
+    final cells = _SplineCell.spans(patch);
+    // A coincident patch is not a boundary-only contact certificate.
+    final ranges = cells.map(range).toList();
+    final high = ranges.map((r) => r.$2).reduce(math.max),
+        low = ranges.map((r) => r.$1).reduce(math.min);
+    final sign = high.abs() >= low.abs() ? 1 : -1;
+    if (ranges.every((r) => math.max(r.$1.abs(), r.$2.abs()) <= r.$3)) {
+      return false;
+    }
+    var visited = 0;
+    bool prove(_SplineCell cell, int depth) {
+      if (++visited > 4096) return false;
+      final r = range(cell);
+      if (sign > 0 ? r.$1 >= -r.$3 : r.$2 <= r.$3) return true;
+      if (depth >= 16 || (sign > 0 ? r.$2 < -r.$3 : r.$1 > r.$3)) return false;
+      return cell.split().every((c) => prove(c, depth + 1));
+    }
+
+    return cells.every((c) => prove(c, 0));
   }
 
   /// Verified ray/surface roots in the bounded spline domain. Ambiguous

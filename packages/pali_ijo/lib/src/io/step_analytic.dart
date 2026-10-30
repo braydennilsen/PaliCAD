@@ -208,7 +208,14 @@ class IjoStepBrep {
   static StepBrepReadResult readAll(
     Uint8List bytes, {
     bool allowOpenShells = false,
-  }) => StepReader.read(bytes, allowOpenShells: allowOpenShells);
+    bool repairDegenerateFaces = false,
+    void Function(int completed, int total)? onProgress,
+  }) => StepReader.read(
+    bytes,
+    allowOpenShells: allowOpenShells,
+    repairDegenerateFaces: repairDegenerateFaces,
+    onProgress: onProgress,
+  );
 
   static String _stem(String path) {
     final slash = path.lastIndexOf(RegExp(r'[/\\]'));

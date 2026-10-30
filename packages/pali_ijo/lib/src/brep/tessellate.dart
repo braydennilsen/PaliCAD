@@ -15,17 +15,42 @@ class TessellatedBrep {
   final MeshData mesh;
 }
 
+/// Circular display chords must stay inside a narrow annular face. Apply the
+/// density to the entire body so its adjoining faces share the same samples.
+class _BoundaryTessellation extends MeshTessellation {
+  _BoundaryTessellation(MeshTessellation base, this.minimum)
+    : super(
+        base.quality,
+        surfaceChordToleranceMm: base.surfaceChordToleranceMm,
+        maxSurfaceRefinement: base.maxSurfaceRefinement,
+      );
+  final int minimum;
+  @override
+  int get cylinderSegments => math.max(super.cylinderSegments, minimum);
+  @override
+  int filletArcSegments(double radius, double angleRad) => math.max(
+    super.filletArcSegments(radius, angleRad),
+    (minimum * angleRad.abs() / (2 * math.pi)).ceil(),
+  );
+}
+
 /// Tessellates a B-Rep into display triangles tagged with [MeshData.faceIds].
 class BrepTessellate {
   BrepTessellate._();
 
+  /// [onProgress] counts completed faces, not elapsed processing time.
   static MeshData run(
     BrepSolid solid, {
     MeshTessellation tessellation = MeshTessellation.standard,
+    void Function(int completed, int total)? onProgress,
   }) {
     final transformed = BrepXform.unwrapAffine(solid);
     if (transformed != null) {
-      final mesh = run(transformed.solid, tessellation: tessellation);
+      final mesh = run(
+        transformed.solid,
+        tessellation: tessellation,
+        onProgress: onProgress,
+      );
       final m = transformed.transform;
       final vertices = [for (final p in mesh.vertices) m.point(p)];
       final edgeIds = <String, int>{};
@@ -50,6 +75,87 @@ class BrepTessellate {
         edgeIds: edgeIds,
       );
     }
+    var minimumSegments = tessellation.cylinderSegments;
+    for (final face in solid.faces) {
+      if (face.surface is! BrepPlane || face.loops.length != 2) continue;
+      // A polygonal recess can approach a round rim more closely than its
+      // display chord error (e.g. the corners of a cross-head screw socket).
+      // Bound each straight side by its endpoints and preserve that clearance.
+      final outerUses = face.loops.first.coedges;
+      if (outerUses.length == 1 &&
+          solid.edges[outerUses.single.edge].curve is BrepCircle &&
+          face.loops
+              .skip(1)
+              .every(
+                (l) => l.coedges.every(
+                  (co) => solid.edges[co.edge].curve is BrepLine,
+                ),
+              )) {
+        final rim = solid.edges[outerUses.single.edge].curve as BrepCircle;
+        if (rim.isClosed) {
+          var extent = 0.0;
+          for (final l in face.loops.skip(1))
+            for (final co in l.coedges) {
+              final line = solid.edges[co.edge].curve as BrepLine;
+              extent = math.max(
+                extent,
+                math.max(
+                  (line.a - rim.center).length,
+                  (line.b - rim.center).length,
+                ),
+              );
+            }
+          final clearance = rim.radius - extent;
+          if (clearance > 1e-9 && extent > 0) {
+            final angle = math.acos(
+              (1 - clearance / (4 * rim.radius)).clamp(-1.0, 1.0),
+            );
+            if (angle > 0)
+              minimumSegments = math.max(
+                minimumSegments,
+                (math.pi / angle).ceil(),
+              );
+          }
+        }
+      }
+      final circles = <BrepCircle>[];
+      var circular = true;
+      for (final loop in face.loops) {
+        BrepCircle? first;
+        var sweep = 0.0;
+        for (final co in loop.coedges) {
+          final c = solid.edges[co.edge].curve;
+          if (c is! BrepCircle) {
+            circular = false;
+            break;
+          }
+          first ??= c;
+          if ((c.center - first.center).length > 1e-7 ||
+              (c.radius - first.radius).abs() > 1e-7 ||
+              c.normal.cross(first.normal).length > 1e-7)
+            circular = false;
+          sweep += (c.t1 - c.t0).abs();
+        }
+        if (first == null || (sweep - 2 * math.pi).abs() > 1e-6) {
+          circular = false;
+        } else {
+          circles.add(first);
+        }
+      }
+      if (!circular ||
+          circles.length != 2 ||
+          (circles[0].center - circles[1].center).length > 1e-7)
+        continue;
+      final outer = math.max(circles[0].radius, circles[1].radius);
+      final gap = (circles[0].radius - circles[1].radius).abs();
+      if (gap <= 1e-9 || outer <= 0) continue;
+      final angle = math.acos((1 - gap / (4 * outer)).clamp(-1.0, 1.0));
+      if (angle > 0)
+        minimumSegments = math.max(minimumSegments, (math.pi / angle).ceil());
+    }
+    if (minimumSegments > tessellation.cylinderSegments) {
+      tessellation = _BoundaryTessellation(tessellation, minimumSegments);
+    }
     final trimmedRuled = solid.edges.any(
       (e) =>
           e.curve is BrepSurfaceIntersectionCurve ||
@@ -72,6 +178,7 @@ class BrepTessellate {
     }
 
     for (var fi = 0; fi < solid.faces.length; fi++) {
+      onProgress?.call(fi, solid.faces.length);
       final face = solid.faces[fi];
       final s = face.surface;
       if (IjoLog.verbose)
@@ -122,9 +229,15 @@ class BrepTessellate {
       } else if (s is BrepSplineSurface || s is BrepOffsetSurface) {
         _parametric(solid, face, fi, tessellation, addTri);
       } else if (s is BrepRuledSurface) {
-        if (trimmedRuled ||
+        // Exact sweep rectangles share the same samples as their cap edges,
+        // including affine spline rails and circular rails in mixed profiles.
+        if (_tensorRectangle(solid, face, fi, tessellation, addTri)) {
+          continue;
+        } else if (trimmedRuled ||
             s.lower is BrepSplineCurve ||
             s.upper is BrepSplineCurve ||
+            s.lower is BrepAffineCurve ||
+            s.upper is BrepAffineCurve ||
             face.loops.any(
               (loop) => loop.coedges.any(
                 (co) =>
@@ -154,7 +267,7 @@ class BrepTessellate {
       }
     }
 
-    return _tagBrepEdges(
+    final mesh = _tagBrepEdges(
       solid,
       _weld(
         MeshData(vertices: verts, faces: faces, faceIds: faceIds),
@@ -169,6 +282,8 @@ class BrepTessellate {
       ),
       tessellation.cylinderSegments,
     );
+    onProgress?.call(solid.faces.length, solid.faces.length);
+    return mesh;
   }
 
   /// A ruled strip trimmed at two constant sweep parameters is still ruled.
@@ -430,6 +545,11 @@ class BrepTessellate {
     void Function(Vector3, Vector3, Vector3, int) emit,
   ) {
     final s = face.surface;
+    final locator = s is BrepSplineSurface ? BrepSplineSurfaceLocator(s) : null;
+    (double, double) locate(Vector3 p) =>
+        locator?.parameters(p) ??
+        (s.parameters(p) ??
+            (throw BrepUnsupported('Cannot resolve surface boundary')));
     if (_tensorRectangle(solid, face, fi, tess, emit)) return;
     if (_ruledConstantBand(solid, face, fi, tess, emit)) return;
     if (face.loops.isEmpty && s is BrepSplineSurface) {
@@ -463,21 +583,48 @@ class BrepTessellate {
       }
       return;
     }
+    final chart = s is BrepSplineSurface
+        ? s
+        : s is BrepOffsetSurface && s.base is BrepSplineSurface
+        ? s.base as BrepSplineSurface
+        : null;
+    // Offset surfaces expose a normalized chart even when their base does not.
+    final pu0 = s is BrepSplineSurface ? s.u0 : 0.0;
+    final pu1 = s is BrepSplineSurface ? s.u1 : 1.0;
+    final pv0 = s is BrepSplineSurface ? s.v0 : 0.0;
+    final pv1 = s is BrepSplineSurface ? s.v1 : 1.0;
+    final offsetExtrusion =
+        s is BrepOffsetSurface &&
+        chart != null &&
+        chart.degreeV == 1 &&
+        chart.points.first.length == 2 &&
+        List.generate(chart.points.length, (i) => i).every(
+          (i) =>
+              (chart.weights[i][0] - chart.weights[i][1]).abs() < 1e-12 &&
+              ((chart.points[i][1] - chart.points[i][0]) -
+                          (chart.points[0][1] - chart.points[0][0]))
+                      .length <
+                  1e-8,
+        );
     var bandLoops = face.loops;
-    if (s is BrepRuledSurface &&
+    if ((s is BrepRuledSurface ||
+            s is BrepSplineSurface && s.ruled != null ||
+            offsetExtrusion) &&
         face.loops.length == 1 &&
-        [
-          0.0,
-          .5,
-          1.0,
-        ].every((v) => (s.evaluate(0, v) - s.evaluate(1, v)).length < 1e-7)) {
+        [0.0, .5, 1.0].every(
+          (v) =>
+              (s.evaluate(pu0, pv0 + (pv1 - pv0) * v) -
+                      s.evaluate(pu1, pv0 + (pv1 - pv0) * v))
+                  .length <
+              1e-7,
+        )) {
       final levels = <double, List<BrepCoedge>>{};
       var valid = true;
       for (final co in face.loops.single.coedges) {
         final c = solid.edges[co.edge].curve;
         final uv = [
           for (final t in [0.0, .5, 1.0])
-            s.parameters(c.evaluate(c.t0 + (c.t1 - c.t0) * t)),
+            locate(c.evaluate(c.t0 + (c.t1 - c.t0) * t)),
         ];
         if ((uv[0].$2 - uv[1].$2).abs() < 1e-7 &&
             (uv[0].$2 - uv[2].$2).abs() < 1e-7) {
@@ -498,13 +645,11 @@ class BrepTessellate {
       if (valid && levels.length == 2)
         bandLoops = [for (final uses in levels.values) BrepLoop(uses)];
     }
-    final pu0 = s is BrepSplineSurface ? s.u0 : 0.0,
-        pu1 = s is BrepSplineSurface ? s.u1 : 1.0;
-    final pv0 = s is BrepSplineSurface ? s.v0 : 0.0,
-        pv1 = s is BrepSplineSurface ? s.v1 : 1.0;
-    if ((s is BrepSplineSurface || s is BrepRuledSurface) &&
+    if ((s is BrepSplineSurface || s is BrepRuledSurface || offsetExtrusion) &&
         bandLoops.length == 2 &&
-        (s is BrepRuledSurface || s is BrepSplineSurface && s.degreeV == 1) &&
+        (s is BrepRuledSurface ||
+            s is BrepSplineSurface && s.degreeV == 1 ||
+            offsetExtrusion) &&
         [0.0, .25, .5, .75, 1.0].every(
           (t) =>
               (s.evaluate(pu0, pv0 + (pv1 - pv0) * t) -
@@ -523,7 +668,7 @@ class BrepTessellate {
             ring = <(double, Vector3)>[];
         var v = 0.0;
         for (final p in points) {
-          final uv = s.parameters(p)!;
+          final uv = locate(p);
           var u = uv.$1;
           if ((u - pu1).abs() < 1e-7) u = pu0;
           ring.add((u, p));
@@ -597,36 +742,60 @@ class BrepTessellate {
     }
     final builder = BrepBuilder(), world = <String, Vector3>{};
     String key(Vector3 p) => '${(p.x * 1e10).round()}:${(p.y * 1e10).round()}';
+    final canWrap =
+        s is BrepSplineSurface ||
+        s is BrepOffsetSurface ||
+        s is BrepRuledSurface;
+    final periodicU =
+        canWrap &&
+        [0.0, .25, .5, .75, 1.0].every(
+          (t) =>
+              (s.evaluate(pu0, pv0 + (pv1 - pv0) * t) -
+                      s.evaluate(pu1, pv0 + (pv1 - pv0) * t))
+                  .length <
+              1e-7,
+        );
+    final periodicV =
+        canWrap &&
+        [0.0, .25, .5, .75, 1.0].every(
+          (t) =>
+              (s.evaluate(pu0 + (pu1 - pu0) * t, pv0) -
+                      s.evaluate(pu0 + (pu1 - pu0) * t, pv1))
+                  .length <
+              1e-7,
+        );
+    double wrap(double p, double start, double end, bool periodic) =>
+        periodic && (p < start || p > end)
+        ? start + (p - start) % (end - start)
+        : p;
+    Vector3 evaluateChart(Vector3 uv) => s.evaluate(
+      wrap(uv.x, pu0, pu1, periodicU),
+      wrap(uv.y, pv0, pv1, periodicV),
+    );
     final loops = <BrepLoop>[];
     for (final loop in face.loops) {
       final points = sampleLoop(solid, loop, tess.cylinderSegments, tess: tess),
           uv = <Vector3>[];
-      final periodic =
-          (s is BrepSplineSurface || s is BrepOffsetSurface) &&
-          [0.0, .5, 1.0].every(
-            (t) =>
-                (s.evaluate(pu0, pv0 + (pv1 - pv0) * t) -
-                        s.evaluate(pu1, pv0 + (pv1 - pv0) * t))
-                    .length <
-                1e-7,
-          );
-      final period = periodic ? pu1 - pu0 : 0.0;
       for (final p in points) {
-        final pair = s.parameters(p);
-        if (pair == null)
-          throw BrepUnsupported('Cannot resolve surface boundary');
-        var u = pair.$1;
-        if (periodic && uv.isNotEmpty) {
-          while (u - uv.last.x > period * .5) u -= period;
-          while (u - uv.last.x < -period * .5) u += period;
+        final pair = locate(p);
+        final q = Vector3(pair.$1, pair.$2, 0);
+        for (var axis = 0; axis < 2; axis++) {
+          final periodic = axis == 0 ? periodicU : periodicV;
+          final period = axis == 0 ? pu1 - pu0 : pv1 - pv0;
+          if (!periodic || uv.isEmpty) continue;
+          while (q[axis] - uv.last[axis] > period * .5) q[axis] -= period;
+          while (q[axis] - uv.last[axis] < -period * .5) q[axis] += period;
         }
-        uv.add(Vector3(u, pair.$2, 0));
+        uv.add(q);
       }
-      if (periodic) {
-        final center = (pu0 + pu1) / 2,
-            mean = uv.fold(0.0, (double sum, p) => sum + p.x) / uv.length,
-            shift = ((center - mean) / period).round() * period;
-        for (final q in uv) q.x += shift;
+      for (var axis = 0; axis < 2; axis++) {
+        if (!(axis == 0 ? periodicU : periodicV)) continue;
+        final start = axis == 0 ? pu0 : pv0, end = axis == 0 ? pu1 : pv1;
+        final mean = uv.fold(0.0, (double sum, p) => sum + p[axis]) / uv.length;
+        final shift =
+            (((start + end) * .5 - mean) / (end - start)).round() *
+            (end - start);
+        for (final q in uv) q[axis] += shift;
       }
       for (var i = 0; i < uv.length; i++) world[key(uv[i])] = points[i];
       if (uv.length < 3) continue;
@@ -660,13 +829,32 @@ class BrepTessellate {
         : null;
     final triangles = strip ?? <List<Vector3>>[];
     if (strip == null) {
-      _plane(
-        flat,
-        flat.faces.single,
-        fi,
-        tess,
-        (a, b, c, _) => triangles.add([a, b, c]),
+      final rings = [
+        for (final loop in flat.faces.single.loops)
+          [
+            for (final co in loop.coedges)
+              co.reversed ? flat.edges[co.edge].v1 : flat.edges[co.edge].v0,
+          ],
+      ];
+      var cells = MeshPolygon.triangulateRings(
+        flat.vertices,
+        rings,
+        Vector3(0, 0, 1),
+        keepCollinear: true,
       );
+      if (cells.isEmpty) {
+        cells = MeshPolygon.triangulateRings(
+          flat.vertices,
+          rings,
+          Vector3(0, 0, -1),
+          keepCollinear: true,
+        );
+      }
+      if (cells.isEmpty)
+        throw BrepUnsupported('Cannot triangulate surface parameter boundary');
+      for (final cell in cells) {
+        triangles.add([for (final id in cell) flat.vertices[id]]);
+      }
     }
     final shortenDiagonals = helical && strip == null;
     if (shortenDiagonals) {
@@ -697,7 +885,7 @@ class BrepTessellate {
       // They carry no area; sending them into edge refinement would request
       // a third vertex from a triangle that only has two distinct vertices.
       final positions = [
-        for (final p in points) world[key(p)] ?? s.evaluate(p.x, p.y),
+        for (final p in points) world[key(p)] ?? evaluateChart(p),
       ];
       final originalCount = points.length;
       (int, int) pair(int a, int b) => a < b ? (a, b) : (b, a);
@@ -717,12 +905,16 @@ class BrepTessellate {
           };
       _improveChartTriangles(points, indices);
       for (var pass = 0; pass < tess.maxSurfaceRefinement; pass++) {
+        if (IjoLog.verbose)
+          IjoLog.line(
+            'parametric face $fi refinement $pass: ${indices.length} triangles',
+          );
         final splits = <(int, int), int>{};
         for (final t in indices)
           for (var i = 0; i < 3; i++) {
             final a = t[i], b = t[(i + 1) % 3], edge = pair(a, b);
             if (fixed.contains(edge) || splits.containsKey(edge)) continue;
-            final uv = (points[a] + points[b]) * .5, p = s.evaluate(uv.x, uv.y);
+            final uv = (points[a] + points[b]) * .5, p = evaluateChart(uv);
             if (!(a < originalCount && b < originalCount) &&
                 (p - (positions[a] + positions[b]) * .5).length <= tolerance)
               continue;
@@ -775,7 +967,7 @@ class BrepTessellate {
                   .reduce(math.max) *
               (1 - math.cos(math.pi / tess.cylinderSegments))
         : 0.0;
-    Vector3 point(Vector3 uv) => world[key(uv)] ?? s.evaluate(uv.x, uv.y);
+    Vector3 point(Vector3 uv) => world[key(uv)] ?? evaluateChart(uv);
     // A chord joining two original boundary vertices can coincide with an
     // interior chord on the neighbouring face. Give it a surface midpoint so
     // welding cannot merge unrelated diagonals across the cut boundary.
@@ -1327,6 +1519,10 @@ class BrepTessellate {
     return math.max(16, circleSegs);
   }
 
+  static bool _isLinearCurve(BrepCurve curve) =>
+      curve is BrepLine ||
+      curve is BrepAffineCurve && _isLinearCurve(curve.base);
+
   static List<Vector3> sampleLoop(
     BrepSolid solid,
     BrepLoop loop,
@@ -1346,7 +1542,8 @@ class BrepTessellate {
         BrepRuledQuadricCurve() => math.max(32, circleSegs),
         BrepPlaneSectionCurve() => math.max(16, circleSegs),
         BrepSplineCurve() => _splineSamples(curve, circleSegs, tess),
-        BrepAffineCurve() => math.max(8, circleSegs),
+        BrepAffineCurve() =>
+          _isLinearCurve(curve) ? 1 : math.max(8, circleSegs),
         BrepLine() => 1,
         BrepIntersectionCurve() => math.max(
           8,
@@ -1383,7 +1580,11 @@ class BrepTessellate {
       }
       final a0 = curve.evaluate(curve.t0);
       final a1 = curve.evaluate(curve.t1);
-      final forward = (start - a0).length <= (start - a1).length;
+      // A closed spline/affine curve has coincident endpoints. Distances
+      // cannot identify its traversal direction; use the oriented coedge.
+      final forward = e.v0 == e.v1 && (a0 - a1).length < 1e-8
+          ? !c.reversed
+          : (start - a0).length <= (start - a1).length;
       for (var i = 0; i < n; i++) {
         if (i == 0) {
           pts.add(start.clone());
@@ -2275,7 +2476,7 @@ class BrepTessellate {
     void Function(Vector3, Vector3, Vector3, int) addTri,
   ) {
     final surface = face.surface;
-    final loops = <List<Vector3>>[];
+    final loops = <List<Vector3>>[], sampledLoops = <List<Vector3>>[];
     final boundaryWorld = <String, Vector3>{};
     String worldKey(double u, double v) =>
         '${(math.cos(u) * 1e8).round()}:${(math.sin(u) * 1e8).round()}:${(v * 1e8).round()}';
@@ -2300,8 +2501,66 @@ class BrepTessellate {
         }
       }
       loops.add(uv);
+      sampledLoops.add(points);
     }
     if (loops.isEmpty) return;
+    // Two closed rims bound a cylindrical band, not a planar outer ring and
+    // hole in UV. They may be split across several elliptic/circular edges.
+    if (surface is BrepCylinder &&
+        loops.length == 2 &&
+        loops.every((ring) {
+          final span = ring.last.x - ring.first.x;
+          if (span.abs() < math.pi) return false;
+          for (var i = 1; i < ring.length; i++) {
+            if ((ring[i].x - ring[i - 1].x) * span < -1e-8) return false;
+          }
+          return true;
+        })) {
+      final rows = [
+        for (var k = 0; k < 2; k++)
+          [
+            for (var i = 0; i < loops[k].length; i++)
+              (loops[k][i].x % (2 * math.pi), sampledLoops[k][i]),
+          ]..sort((a, b) => a.$1.compareTo(b.$1)),
+      ];
+      final a = rows[0], b = rows[1];
+      void triangle(Vector3 p, Vector3 q, Vector3 r) {
+        final uv = surface.parameters((p + q + r) / 3)!;
+        final normal =
+            surface.normalAt(uv.$1, uv.$2) * (face.reversed ? -1.0 : 1.0);
+        if ((q - p).cross(r - p).dot(normal) < 0)
+          addTri(p, r, q, fi);
+        else
+          addTri(p, q, r, fi);
+      }
+
+      var i = 0, j = 0;
+      while (i < a.length || j < b.length) {
+        final ua = i < a.length
+            ? a[(i + 1) % a.length].$1 + (i + 1 == a.length ? 2 * math.pi : 0)
+            : double.infinity;
+        final ub = j < b.length
+            ? b[(j + 1) % b.length].$1 + (j + 1 == b.length ? 2 * math.pi : 0)
+            : double.infinity;
+        if (ua <= ub) {
+          triangle(
+            a[i % a.length].$2,
+            a[(i + 1) % a.length].$2,
+            b[j % b.length].$2,
+          );
+          i++;
+        } else {
+          triangle(
+            a[i % a.length].$2,
+            b[(j + 1) % b.length].$2,
+            b[j % b.length].$2,
+          );
+          j++;
+        }
+      }
+      return;
+    }
+
     final plane = BrepPlane(
       origin: Vector3.zero(),
       normal: Vector3(0, 0, 1),
@@ -2336,13 +2595,14 @@ class BrepTessellate {
     ];
     _shortenParameterDiagonals(initial);
     final collapsedVertices = <int>{};
-    triangles = [
-      for (final t in initial) [for (final p in t) vertex(p)],
-    ]..removeWhere((t) {
-      if (t[0] != t[1] && t[1] != t[2] && t[2] != t[0]) return false;
-      collapsedVertices.addAll(t);
-      return true;
-    });
+    triangles =
+        [
+          for (final t in initial) [for (final p in t) vertex(p)],
+        ]..removeWhere((t) {
+          if (t[0] != t[1] && t[1] != t[2] && t[2] != t[0]) return false;
+          collapsedVertices.addAll(t);
+          return true;
+        });
     // STEP rounding can create slivers whose UV vertices weld together.
     // They have no area after welding and cannot be refined as triangles.
     // Refine interior chords in parameter space without changing the shared
@@ -3230,36 +3490,50 @@ class BrepTessellate {
       return u.dot(v) / (u.x * v.y - u.y * v.x).abs();
     }
 
-    for (var pass = 0; pass < 64; pass++) {
-      final uses = <(int, int), List<int>>{};
-      for (var i = 0; i < triangles.length; i++) {
-        final t = triangles[i];
-        for (var k = 0; k < 3; k++) {
-          final a = t[k], b = t[(k + 1) % 3];
-          (uses[a < b ? (a, b) : (b, a)] ??= []).add(i);
-        }
+    (int, int) edge(int a, int b) => a < b ? (a, b) : (b, a);
+    final uses = <(int, int), Set<int>>{};
+    final pending = <(int, int)>[], queued = <(int, int)>{};
+    void add(int i, {bool enqueue = false}) {
+      final t = triangles[i];
+      for (var k = 0; k < 3; k++) {
+        final e = edge(t[k], t[(k + 1) % 3]);
+        (uses[e] ??= {}).add(i);
+        if (enqueue && queued.add(e)) pending.add(e);
       }
-      final changed = <int>{};
-      for (final entry in uses.entries) {
-        if (entry.value.length != 2) continue;
-        final i = entry.value[0], j = entry.value[1];
-        if (changed.contains(i) || changed.contains(j)) continue;
-        final a = entry.key.$1, b = entry.key.$2;
-        final c = triangles[i].firstWhere((v) => v != a && v != b);
-        final d = triangles[j].firstWhere((v) => v != a && v != b);
-        if (c == d ||
-            cross(a, b, c) * cross(a, b, d) >= 0 ||
-            cross(c, d, a) * cross(c, d, b) >= 0) {
-          continue;
-        }
-        // Opposite angles greater than pi mean the other diagonal improves
-        // the minimum angle. Leave cocircular quads alone to avoid flip cycles.
-        if (cot(a, c, b) + cot(a, d, b) >= -1e-10) continue;
-        triangles[i] = [c, d, a];
-        triangles[j] = [d, c, b];
-        changed.addAll([i, j]);
+    }
+
+    void remove(int i) {
+      final t = triangles[i];
+      for (var k = 0; k < 3; k++) {
+        final e = edge(t[k], t[(k + 1) % 3]);
+        uses[e]!.remove(i);
+        if (uses[e]!.isEmpty) uses.remove(e);
       }
-      if (changed.isEmpty) break;
+    }
+
+    for (var i = 0; i < triangles.length; i++) add(i, enqueue: true);
+    // Update only the neighbours of a flipped edge. A fixed number of global
+    // sweeps left long fan diagonals on slender multi-turn STEP patches;
+    // subdivision then multiplied those diagonals into millions of triangles.
+    while (pending.isNotEmpty) {
+      final e = pending.removeLast();
+      queued.remove(e);
+      final adjacent = uses[e];
+      if (adjacent == null || adjacent.length != 2) continue;
+      final i = adjacent.first, j = adjacent.last, a = e.$1, b = e.$2;
+      final c = triangles[i].firstWhere((v) => v != a && v != b);
+      final d = triangles[j].firstWhere((v) => v != a && v != b);
+      if (c == d ||
+          cross(a, b, c) * cross(a, b, d) >= 0 ||
+          cross(c, d, a) * cross(c, d, b) >= 0)
+        continue;
+      if (cot(a, c, b) + cot(a, d, b) >= -1e-10) continue;
+      remove(i);
+      remove(j);
+      triangles[i] = [c, d, a];
+      triangles[j] = [d, c, b];
+      add(i, enqueue: true);
+      add(j, enqueue: true);
     }
   }
 
@@ -3344,6 +3618,67 @@ class BrepTessellate {
     }
     final uSpan = (u1 - u0).abs();
     final vSpan = (v1 - v0).abs();
+    // Partial toroidal rims have different radii at their two ends. Sample
+    // each shared circle exactly as its adjacent planar/cylindrical face,
+    // then zipper adjacent rows instead of forcing both onto one angular grid.
+    if (uSpan < math.pi * 2 - 1e-6 &&
+        vSpan < math.pi - 1e-7 &&
+        face.loops.length == 1 &&
+        face.loops.single.coedges.every((co) {
+          final c = solid.edges[co.edge].curve;
+          if (c is! BrepCircle) return false;
+          final uv = [
+            for (final t in [0.0, .25, .5, .75, 1.0])
+              s.parameters(c.evaluate(c.t0 + (c.t1 - c.t0) * t))!,
+          ];
+          bool fixed(bool u) => uv.every(
+            (p) =>
+                math
+                    .sin(
+                      ((u ? p.$1 : p.$2) - (u ? uv.first.$1 : uv.first.$2)) *
+                          .5,
+                    )
+                    .abs() <
+                1e-7,
+          );
+          return fixed(true) || fixed(false);
+        })) {
+      final nv = tess.filletArcSegments(s.minorRadius, vSpan);
+      List<Vector3> row(int j) {
+        final v = v0 + (v1 - v0) * j / nv;
+        final radius = s.majorRadius + s.minorRadius * math.cos(v);
+        final count = tess.filletArcSegments(radius.abs(), uSpan);
+        return [
+          for (var i = 0; i <= count; i++)
+            s.evaluate(u0 + (u1 - u0) * i / count, v),
+        ];
+      }
+
+      void emit(Vector3 a, Vector3 b, Vector3 c) {
+        if (face.reversed) {
+          addTri(a, c, b, fi);
+        } else {
+          addTri(a, b, c, fi);
+        }
+      }
+
+      var a = row(0);
+      for (var j = 1; j <= nv; j++) {
+        final b = row(j), na = a.length - 1, nb = b.length - 1;
+        var ia = 0, ib = 0;
+        while (ia < na || ib < nb) {
+          if (ia < na && (ib == nb || (ia + 1) / na <= (ib + 1) / nb)) {
+            emit(a[ia], a[ia + 1], b[ib]);
+            ia++;
+          } else {
+            emit(a[ia], b[ib + 1], b[ib]);
+            ib++;
+          }
+        }
+        a = b;
+      }
+      return;
+    }
     final nU = math.max(4, (nu * uSpan / (math.pi * 2)).ceil());
     final nV = vSpan > math.pi * 1.5
         ? math.max(4, (nu * vSpan / (math.pi * 2)).ceil())
@@ -3842,6 +4177,12 @@ class BrepTessellate {
         return;
       }
     }
+    // STEP can place the cone apex at either parameter end (or outside
+    // its nominal unit-height representation). Inspect the trim itself.
+    if (face.loops.length == 1 &&
+        face.loops.single.coedges.length > 1 &&
+        _coneApexPatch(solid, s, face, fi, tess, addTri))
+      return;
     if (_coneFromClosedLoops(solid, s, face, fi, tess, addTri)) return;
     // Trimmed frusta must share their actual rim samples with adjoining
     // faces. An independent angular grid leaves cracks at those rims.
